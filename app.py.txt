@@ -1,0 +1,250 @@
+# app.py
+# Streamlit macro dashboard MVP — 12 canonical US charts
+# Usage: set FRED_API_KEY env var before running
+# pip install -r requirements.txt
+import os
+import streamlit as st
+import pandas as pd
+import numpy as np
+from fredapi import Fred
+import matplotlib.pyplot as plt
+import requests
+from io import StringIO
+
+st.set_page_config(page_title="12-Chart US Macro Dashboard", layout="wide")
+
+FRED_API_KEY = os.getenv("FRED_API_KEY")
+if not FRED_API_KEY:
+    st.warning("Set FRED_API_KEY environment variable (get one at https://fred.stlouisfed.org)")
+    st.stop()
+
+fred = Fred(api_key=FRED_API_KEY)
+
+st.title("12-Chart US Macro Dashboard — MVP")
+
+# --- series mapping (FRED IDs) ---
+SERIES = {
+    "CPI": "CPIAUCSL",
+    "Core CPI": "CPILFESL",
+    "Core PCE": "PCEPILFE",
+    "5y5y inflation": "T5YIFR",
+    "Real GDP (level)": "GDPC1",
+    "Industrial Production": "INDPRO",
+    "Real Retail Sales (adv)": "RRSFS",
+    "Unemployment": "UNRATE",
+    "JOLTS (Job Openings)": "JTSJOL",
+    "Consumer Sentiment (UMich)": "UMCSENT",
+    "10y Treasury": "DGS10",
+    "2y Treasury": "DGS2",
+}
+
+@st.cache_data(ttl=3600)
+def fetch_fred(series_id, start=None):
+    try:
+        s = fred.get_series(series_id)
+        # convert index to pandas datetime (fred returns pd.Series with DatetimeIndex)
+        s = s.dropna()
+        return s
+    except Exception as e:
+        st.error(f"Error fetching {series_id}: {e}")
+        return pd.Series(dtype=float)
+
+# fetch everything (may take a few seconds)
+data = {}
+with st.spinner("Fetching FRED series..."):
+    for name, sid in SERIES.items():
+        data[name] = fetch_fred(sid)
+
+# helper transformations
+def yoy(series):
+    # expects monthly/quarterly index; compute percent change vs same period last year
+    if series.empty:
+        return series
+    if series.index.freq is None:
+        # try to infer monthly
+        s = series.resample('M').last()
+    else:
+        s = series
+    return s.pct_change(periods=12) * 100
+
+def qoq_annualized(series):
+    # For quarterly data (GDP), compute QoQ annualized % change if already percent series use as-is
+    if series.empty:
+        return series
+    # if quarterly; resample to quarterly
+    s = series.resample('Q').last()
+    return (s.pct_change(periods=1) * 100 * 4)  # approximate annualized percent
+
+# Layout: 4 columns per row
+cols = st.columns(4)
+
+# Row 1: Inflation charts (CPI, Core CPI, Core PCE, 5y5y)
+with st.container():
+    st.header("Inflation")
+    items = ["CPI", "Core CPI", "Core PCE", "5y5y inflation"]
+    for i, item in enumerate(items):
+        col = cols[i % 4]
+        with col:
+            s = data[item]
+            if s.empty:
+                st.write(f"**{item}** — data unavailable")
+                continue
+
+            # compute YoY (for CPI/Core CPI/Core PCE). For 5y5y show level
+            if item in ["CPI", "Core CPI", "Core PCE"]:
+                series = yoy(s)
+                latest = series.dropna().iloc[-1] if not series.dropna().empty else np.nan
+                st.metric(label=f"{item} YoY (%)", value=f"{latest:.2f}" if not np.isnan(latest) else "n/a")
+                # plot level of series and YoY below
+                fig, ax = plt.subplots()
+                ax.plot(s.index, s.values)
+                ax.set_title(f"{item} (index)")
+                ax.tick_params(axis='x', rotation=25)
+                st.pyplot(fig)
+
+                fig2, ax2 = plt.subplots()
+                ax2.plot(series.index, series.values)
+                ax2.set_title(f"{item} YoY (%)")
+                ax2.axhline(2.0, linestyle='--', linewidth=0.8)
+                st.pyplot(fig2)
+            elif item == "5y5y inflation":
+                fig, ax = plt.subplots()
+                ax.plot(s.index, s.values)
+                ax.set_title("5y5y Inflation Expectations (%)")
+                st.pyplot(fig)
+
+# Row 2: Growth charts (GDP, ISM (fallback), Industrial Production, Retail Sales)
+st.header("Growth")
+gcols = st.columns(4)
+# GDP
+with gcols[0]:
+    s = data["Real GDP (level)"]
+    if not s.empty:
+        # convert to quarterly and compute QoQ annualized % (we'll show the percent change)
+        q = qoq_annualized(s)
+        latest = q.dropna().iloc[-1] if not q.dropna().empty else np.nan
+        st.metric("Real GDP QoQ annualized (%)", f"{latest:.2f}" if not np.isnan(latest) else "n/a")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("Real GDP (level)")
+        st.pyplot(fig)
+    else:
+        st.write("Real GDP data unavailable")
+
+# ISM PMI: attempt FRED lookup (some ISM series are only available via ISM site)
+with gcols[1]:
+    # naive attempt: look for a 'ISM' series on FRED by checking if the page exists (quick fallback)
+    try:
+        # Attempt to get PMI via a public ISM CSV page (best-effort)
+        ism_url = "https://www.ismworld.org/globalassets/pub/research-and-surveys/rob/rob_legacy_data/2074_ism_manufacturing_pmi.csv"
+        r = requests.get(ism_url, timeout=6)
+        if r.status_code == 200 and len(r.text) > 200:
+            df = pd.read_csv(StringIO(r.text), parse_dates=[0], index_col=0)
+            # assume last column contains PMI values
+            pmi = df.iloc[:,0].dropna()
+            st.metric("ISM Manufacturing PMI (latest)", f"{pmi.iloc[-1]:.1f}")
+            fig, ax = plt.subplots()
+            ax.plot(pmi.index, pmi.values)
+            ax.set_title("ISM Manufacturing PMI")
+            st.pyplot(fig)
+        else:
+            st.write("ISM PMI: fallback - data not found (we can add a more robust fetch)")
+    except Exception as e:
+        st.write("ISM PMI: fetch error (we can add a custom connector).", e)
+
+# Industrial Production
+with gcols[2]:
+    s = data["Industrial Production"]
+    if not s.empty:
+        # YoY
+        s_yoy = yoy(s)
+        latest = s_yoy.dropna().iloc[-1] if not s_yoy.dropna().empty else np.nan
+        st.metric("Industrial Production YoY (%)", f"{latest:.2f}" if not np.isnan(latest) else "n/a")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("Industrial Production (index)")
+        st.pyplot(fig)
+    else:
+        st.write("Industrial Production data unavailable")
+
+# Retail sales (real)
+with gcols[3]:
+    s = data["Real Retail Sales (adv)"]
+    if not s.empty:
+        s_yoy = yoy(s)
+        latest = s_yoy.dropna().iloc[-1] if not s_yoy.dropna().empty else np.nan
+        st.metric("Real Retail Sales YoY (%)", f"{latest:.2f}" if not np.isnan(latest) else "n/a")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("Real Retail Sales (index)")
+        st.pyplot(fig)
+
+# Row 3: Consumer & Labor
+st.header("Consumer & Labor")
+lcols = st.columns(4)
+with lcols[0]:
+    s = data["Unemployment"]
+    if not s.empty:
+        latest = s.dropna().iloc[-1]
+        st.metric("Unemployment rate (%)", f"{latest:.2f}")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("Unemployment Rate")
+        st.pyplot(fig)
+
+with lcols[1]:
+    s = data["JOLTS (Job Openings)"]
+    if not s.empty:
+        latest = s.dropna().iloc[-1]
+        st.metric("Job openings (total, thousands)", f"{latest:.0f}")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("JOLTS - Job Openings")
+        st.pyplot(fig)
+
+with lcols[2]:
+    s = data["Consumer Sentiment (UMich)"]
+    if not s.empty:
+        latest = s.dropna().iloc[-1]
+        st.metric("UMich Consumer Sentiment", f"{latest:.1f}")
+        fig, ax = plt.subplots()
+        ax.plot(s.index, s.values)
+        ax.set_title("Consumer Sentiment (UMich)")
+        st.pyplot(fig)
+
+with lcols[3]:
+    st.write("")  # blank for symmetry
+    st.write("Optional: add other consumer charts here.")
+
+# Row 4: Financial conditions — yield curve
+st.header("Financial Conditions")
+fcols = st.columns(2)
+with fcols[0]:
+    y10 = data["10y Treasury"]
+    y2 = data["2y Treasury"]
+    if not y10.empty and not y2.empty:
+        # align and compute spread
+        df = pd.concat([y10, y2], axis=1).dropna()
+        df.columns = ["DGS10", "DGS2"]
+        df["10y-2y"] = df["DGS10"] - df["DGS2"]
+        latest = df["10y-2y"].iloc[-1]
+        st.metric("10y − 2y (bps)", f"{latest*100:.1f}")
+        fig, ax = plt.subplots()
+        ax.plot(df.index, df["10y-2y"]*100)  # bps
+        ax.set_title("10y − 2y (basis points)")
+        st.pyplot(fig)
+    else:
+        st.write("Treasury yield data unavailable")
+
+with fcols[1]:
+    st.write("Notes")
+    st.markdown("""
+    - Data pulled from FRED using `fredapi`.  
+    - CPI/ Core CPI / Core PCE shown as index + YoY %.  
+    - GDP shown as level + QoQ annualized percent.  
+    - ISM PMI attempted from ISM CSV fallback; we can replace with a better source.  
+    - You must set `FRED_API_KEY` as a Streamlit secret or environment variable in deployment.
+    """)
+
+st.write("---")
+st.caption("Built as an MVP. Ask me to: (1) save this to a GitHub repo structure, (2) add regime scoring, (3) add Perplexity narratives, (4) configure Streamlit Cloud deploy steps.")
