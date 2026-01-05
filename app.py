@@ -232,7 +232,7 @@ fig_table = go.Figure(data=[go.Table(
                fill_color=cols_color,
                align="center",
                font=dict(color=["#111111"] * (num_quarters+1), size=11),
-               height= thirty := 30)
+               height=30)
 )])
 
 # Adjust width and height for horizontal scroll in Streamlit
@@ -322,3 +322,4 @@ else:
 
 st.write("---")
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
