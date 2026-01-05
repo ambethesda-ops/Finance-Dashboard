@@ -11,9 +11,10 @@ import numpy as np
 from fredapi import Fred
 import requests
 from io import StringIO
-import plotly.graph_objects as go
 import plotly.express as px
 import plotly.colors as pc
+import html as _html
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Quarterly Macro Table + Single Chart", layout="wide")
 
@@ -41,6 +42,7 @@ SERIES = {
 }
 
 # Which indicators where "higher is good" (+1) vs "higher is bad" (-1)
+# IMPORTANT: direction *multiplies* z-score so green=good, red=bad
 INDICATOR_DIRECTION = {
     "CPI": -1,
     "Core CPI": -1,
@@ -155,6 +157,7 @@ def z_to_color(z, vmin=-2.5, vmax=2.5, colorscale=pc.diverging.RdYlGn):
 all_quarters = set()
 series_q_map = {}
 for name, s in data.items():
+    # allow ISM fallback
     if name == "ISM Manufacturing PMI":
         s2 = ism_series
     else:
@@ -163,6 +166,7 @@ for name, s in data.items():
     series_q_map[name] = q
     all_quarters.update(q.index)
 
+# include ISM if present but not in series map
 if not ism_series.empty and "ISM Manufacturing PMI" not in series_q_map:
     q = make_quarterly_series(ism_series)
     series_q_map["ISM Manufacturing PMI"] = q
@@ -172,6 +176,7 @@ if not all_quarters:
     st.error("No quarterly data available.")
     st.stop()
 
+# sort quarters oldest -> newest (user scrolls left to older history)
 quarter_index = sorted(list(all_quarters))
 quarter_labels = [to_quarter_label(q) for q in quarter_index]
 
@@ -192,78 +197,60 @@ for name, qseries in series_q_map.items():
             reported_df.loc[name, label] = "n/a"
             z_df.loc[name, label] = np.nan
 
-# Prepare Plotly table inputs
-table_header = ["Indicator"] + quarter_labels
+# -------------------------
+# Render table as HTML (scrollable) instead of Plotly table (avoids overlapping text)
+# -------------------------
 
-cell_text = []
-row_names = list(reported_df.index)
-for r in row_names:
-    row = [r] + [reported_df.loc[r, col] for col in quarter_labels]
-    cell_text.append(row)
+def render_html_table(reported_df, z_df, quarter_labels, highlight_last=True, cell_font_size=11, col_min_width=100, name_col_width=220):
+    # header row
+    header_cells = ['<th style="position: sticky; left:0; background:#333333; color:white; z-index:2; padding:8px;">Indicator</th>']
+    for i, q in enumerate(quarter_labels):
+        if highlight_last and i == len(quarter_labels) - 1:
+            header_cells.append(f'<th style="background:#cfe2f3; min-width:{col_min_width}px; white-space:nowrap; padding:8px;">{_html.escape(q)}</th>')
+        else:
+            header_cells.append(f'<th style="background:#f0f0f0; min-width:{col_min_width}px; white-space:nowrap; padding:8px;">{_html.escape(q)}</th>')
+    header_html = "<tr>" + "".join(header_cells) + "</tr>"
 
-cells_color = []
-for r in row_names:
-    row_colors = ["#f7f7f7"]
-    for col in quarter_labels:
-        z = z_df.loc[r, col]
-        color = z_to_color(z, vmin=-2.5, vmax=2.5)
-        row_colors.append(color)
-    cells_color.append(row_colors)
+    # body rows
+    body_rows = []
+    for idx in reported_df.index:
+        row_html = []
+        # first cell: indicator name (sticky)
+        row_html.append(f'<td style="position: sticky; left:0; background:#f7f7f7; min-width:{name_col_width}px; text-align:left; padding:8px;">{_html.escape(idx)}</td>')
+        for col in quarter_labels:
+            txt = reported_df.loc[idx, col] if col in reported_df.columns else "n/a"
+            z = z_df.loc[idx, col] if (idx in z_df.index and col in z_df.columns) else np.nan
+            color = z_to_color(z, vmin=-2.5, vmax=2.5)
+            cell_html = f'<td style="background:{color}; min-width:{col_min_width}px; white-space:nowrap; text-align:center; padding:6px 8px; font-size:{cell_font_size}px;">{_html.escape(str(txt))}</td>'
+            row_html.append(cell_html)
+        body_rows.append("<tr>" + "".join(row_html) + "</tr>")
 
-cols_text = list(zip(*cell_text))
-cols_color = list(zip(*cells_color))
-cols_text = [list(c) for c in cols_text]
-cols_color = [list(c) for c in cols_color]
+    table_html = f"""
+    <div style="overflow-x:auto; border:1px solid #eee; padding:6px; margin-bottom:8px;">
+      <table style="border-collapse:collapse; font-family:Arial, Helvetica, sans-serif;">
+        <thead>{header_html}</thead>
+        <tbody>{"".join(body_rows)}</tbody>
+      </table>
+    </div>
+    """
+    return table_html
 
-# Highlight most recent quarter header
-num_quarters = len(quarter_labels)
-# header colors: first column dark, middle columns light, last column highlighted
-header_colors = ["#333333"] + ["#f0f0f0"] * (num_quarters - 1)
-if num_quarters >= 1:
-    header_colors[-1] = "#cfe2f3"  # light blue for most recent quarter
-
-# Build Plotly table
-fig_table = go.Figure(data=[go.Table(
-    header=dict(values=table_header,
-                fill_color=header_colors,
-                font=dict(color=["white"] + ["#111111"] * num_quarters, size=12),
-                align="center"),
-    cells=dict(values=cols_text,
-               fill_color=cols_color,
-               align="center",
-               font=dict(color=["#111111"] * (num_quarters+1), size=11),
-               height=30)
-)])
-
-# Adjust width and height for horizontal scroll in Streamlit
-table_width = max(1000, 120 * num_quarters)
-fig_table.update_layout(margin=dict(l=10, r=10, t=10, b=10), width=table_width, height=420)
-
-# Page
+# Render table
 st.title("Quarterly Values Table — colored by long-term z-score")
 st.markdown("Numbers are **reported values**. Colors show distance from the series' long-run average (green = better, red = worse). Scroll horizontally to view older quarters. Column names show quarter and year like `q42024` (most recent quarter on the right).")
 
-st.plotly_chart(fig_table, use_container_width=True)
+html_table = render_html_table(reported_df, z_df, quarter_labels, highlight_last=True, cell_font_size=11, col_min_width=100, name_col_width=220)
+st.markdown(html_table, unsafe_allow_html=True)
 
 # Legend (z-score ranges)
 st.markdown("")
 legend_html = """
-<div style="display:flex;gap:12px;align-items:center;">
-  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
-    <div style="width:18px;height:18px;background:#a50026;border:1px solid #000;"></div><div><b>&lt;= -2.0</b><br><small>Much worse vs history</small></div>
-  </div>
-  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
-    <div style="width:18px;height:18px;background:#f46d43;border:1px solid #000;"></div><div><b>-2.0 to -1.0</b><br><small>Worse</small></div>
-  </div>
-  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
-    <div style="width:18px;height:18px;background:#fee08b;border:1px solid #000;"></div><div><b>-1.0 to +1.0</b><br><small>Near normal</small></div>
-  </div>
-  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
-    <div style="width:18px;height:18px;background:#d9ef8b;border:1px solid #000;"></div><div><b>+1.0 to +2.0</b><br><small>Better</small></div>
-  </div>
-  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
-    <div style="width:18px;height:18px;background:#006837;border:1px solid #000;"></div><div><b>&gt;= +2.0</b><br><small>Much better vs history</small></div>
-  </div>
+<div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;">
+  <div style="display:flex;gap:6px;align-items:center;"><div style="width:18px;height:18px;background:#a50026;border:1px solid #000;"></div><div><b>&lt;= -2.0</b><br><small>Much worse vs history</small></div></div>
+  <div style="display:flex;gap:6px;align-items:center;"><div style="width:18px;height:18px;background:#f46d43;border:1px solid #000;"></div><div><b>-2.0 to -1.0</b><br><small>Worse</small></div></div>
+  <div style="display:flex;gap:6px;align-items:center;"><div style="width:18px;height:18px;background:#fee08b;border:1px solid #000;"></div><div><b>-1.0 to +1.0</b><br><small>Near normal</small></div></div>
+  <div style="display:flex;gap:6px;align-items:center;"><div style="width:18px;height:18px;background:#d9ef8b;border:1px solid #000;"></div><div><b>+1.0 to +2.0</b><br><small>Better</small></div></div>
+  <div style="display:flex;gap:6px;align-items:center;"><div style="width:18px;height:18px;background:#006837;border:1px solid #000;"></div><div><b>&gt;= +2.0</b><br><small>Much better vs history</small></div></div>
 </div>
 """
 st.markdown(legend_html, unsafe_allow_html=True)
@@ -272,7 +259,11 @@ st.markdown(legend_html, unsafe_allow_html=True)
 st.markdown("---")
 st.subheader("Single indicator chart (select one)")
 indicator_options = list(series_q_map.keys())
-selected = st.selectbox("Select indicator", indicator_options, index=indicator_options.index("CPI") if "CPI" in indicator_options else 0)
+# default to CPI if present
+default_idx = 0
+if "CPI" in indicator_options:
+    default_idx = indicator_options.index("CPI")
+selected = st.selectbox("Select indicator", indicator_options, index=default_idx)
 
 # timeframe for chart
 tf = st.selectbox("Chart timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
@@ -293,6 +284,7 @@ def timeframe_cutoff(series_q, timeframe_key):
         cutoff = pd.Timestamp("1900-01-01")
     return series_q[series_q.index >= cutoff]
 
+# get series for selected indicator
 if selected == "ISM Manufacturing PMI":
     ser = ism_series
 else:
@@ -322,4 +314,3 @@ else:
 
 st.write("---")
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
