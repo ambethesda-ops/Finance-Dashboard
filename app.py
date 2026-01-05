@@ -248,3 +248,4 @@ with fcols[1]:
 
 st.write("---")
 st.caption("Built as an MVP. Ask me to: (1) save this to a GitHub repo structure, (2) add regime scoring, (3) add Perplexity narratives, (4) configure Streamlit Cloud deploy steps.")
+
