@@ -1,7 +1,7 @@
 # app.py
-# Interactive macro dashboard: color-coded long-term z-score heatmap + compact cards + drillable charts
-# Requires FRED_API_KEY environment variable (Streamlit Secrets or env)
-# requirements: streamlit, pandas, numpy, plotly, fredapi, requests, lxml
+# Quarterly text table (values) with color shading by long-term z-score + single selectable interactive chart
+# Requires FRED_API_KEY in Streamlit Secrets or environment
+# Requirements: streamlit, pandas, numpy, plotly, fredapi, requests, lxml
 
 import os
 from datetime import datetime
@@ -11,11 +11,13 @@ import numpy as np
 from fredapi import Fred
 import requests
 from io import StringIO
+import plotly.graph_objects as go
 import plotly.express as px
+import plotly.colors as pc
 
-st.set_page_config(page_title="Macro Snapshot — Heatmap + Charts", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quarterly Macro Table + Single Chart", layout="wide")
 
-# --- FRED setup ---
+# --- FRED / series config ---
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 if not FRED_API_KEY:
     st.warning("Set FRED_API_KEY environment variable (get one at https://fred.stlouisfed.org)")
@@ -23,7 +25,6 @@ if not FRED_API_KEY:
 
 fred = Fred(api_key=FRED_API_KEY)
 
-# --- Series mapping (canonical FRED IDs) ---
 SERIES = {
     "CPI": "CPIAUCSL",
     "Core CPI": "CPILFESL",
@@ -39,7 +40,7 @@ SERIES = {
     "2y Treasury": "DGS2",
 }
 
-# Directionality: +1 means higher = good, -1 means higher = bad
+# Which indicators where "higher is good" (+1) vs "higher is bad" (-1)
 INDICATOR_DIRECTION = {
     "CPI": -1,
     "Core CPI": -1,
@@ -55,9 +56,25 @@ INDICATOR_DIRECTION = {
     "2y Treasury": -1,
 }
 
-# --- Fetching helpers ---
+# Display format: 'pct' => "0.0%", 'float1' => one decimal, 'int' => no decimals
+DISPLAY_TYPE = {
+    "CPI": "float1",
+    "Core CPI": "float1",
+    "Core PCE": "float1",
+    "5y5y inflation": "pct",
+    "Real GDP (level)": "float1",
+    "Industrial Production": "float1",
+    "Real Retail Sales (adv)": "float1",
+    "Unemployment": "pct",
+    "JOLTS (Job Openings)": "int",
+    "Consumer Sentiment (UMich)": "float1",
+    "10y Treasury": "pct",
+    "2y Treasury": "pct",
+}
+
+# --- helpers for fetch & transforms ---
 @st.cache_data(ttl=3600)
-def fetch_fred(series_id):
+def fetch_series_from_fred(series_id):
     try:
         s = fred.get_series(series_id).dropna()
         s.index = pd.to_datetime(s.index)
@@ -70,8 +87,8 @@ def fetch_fred(series_id):
 @st.cache_data(ttl=3600)
 def fetch_ism_csv_fallback():
     try:
-        ism_url = "https://www.ismworld.org/globalassets/pub/research-and-surveys/rob/rob_legacy_data/2074_ism_manufacturing_pmi.csv"
-        r = requests.get(ism_url, timeout=8)
+        url = "https://www.ismworld.org/globalassets/pub/research-and-surveys/rob/rob_legacy_data/2074_ism_manufacturing_pmi.csv"
+        r = requests.get(url, timeout=8)
         if r.status_code == 200 and len(r.text) > 200:
             df = pd.read_csv(StringIO(r.text), parse_dates=[0], index_col=0)
             df.index = pd.to_datetime(df.index)
@@ -80,192 +97,228 @@ def fetch_ism_csv_fallback():
         pass
     return pd.Series(dtype=float)
 
-# Load data
-with st.spinner("Fetching FRED series..."):
-    data = {name: fetch_fred(sid) for name, sid in SERIES.items()}
+# load data
+with st.spinner("Fetching series from FRED..."):
+    data = {name: fetch_series_from_fred(sid) for name, sid in SERIES.items()}
 ism_series = fetch_ism_csv_fallback()
 
-# --- Timeframe helpers ---
-TIMEFRAME_MAP = {
-    "1Y": lambda last: last - pd.DateOffset(years=1),
-    "3Y": lambda last: last - pd.DateOffset(years=3),
-    "5Y": lambda last: last - pd.DateOffset(years=5),
-    "10Y": lambda last: last - pd.DateOffset(years=10),
-    "Max": lambda last: pd.Timestamp("1900-01-01"),
-}
+# --- utility functions ---
+def to_quarter_label(ts: pd.Timestamp):
+    q = ((ts.month - 1) // 3) + 1
+    return f"q{q}{ts.year}"
 
-def filter_series_for_timeframe(s: pd.Series, timeframe_key: str):
+def make_quarterly_series(s: pd.Series):
     if s.empty:
         return s
-    last = s.index.max()
-    cutoff = TIMEFRAME_MAP.get(timeframe_key, TIMEFRAME_MAP["5Y"])(last)
-    return s[s.index >= cutoff]
+    try:
+        q = s.resample('Q').last()
+    except Exception:
+        q = s
+    q = q.dropna()
+    return q
 
-def compute_cagr(series: pd.Series):
-    s = series.dropna()
-    if s.empty or len(s) < 2:
-        return np.nan
-    first_val = float(s.iloc[0])
-    last_val = float(s.iloc[-1])
-    days = (s.index[-1] - s.index[0]).days
-    years = days / 365.25
-    if years <= 0 or first_val <= 0:
-        return np.nan
-    return (last_val / first_val) ** (1 / years) - 1
-
-def compute_long_term_zscore(series: pd.Series, direction: int):
-    """
-    Latest z-score vs long-term mean. direction flips sign to make green=good.
-    """
-    s = series.dropna()
-    if len(s) < 24:
-        return np.nan
+def compute_long_term_z(series_q: pd.Series, direction: int, min_obs=20):
+    s = series_q.dropna()
+    if s.empty or len(s) < min_obs:
+        return pd.Series(index=series_q.index, data=[np.nan]*len(series_q))
     mean = s.mean()
     std = s.std()
     if std == 0 or np.isnan(std):
-        return np.nan
-    z = (s.iloc[-1] - mean) / std
+        return pd.Series(index=series_q.index, data=[np.nan]*len(series_q))
+    z = (series_q - mean) / std
     return z * direction
 
-def yoy(series: pd.Series):
-    if series.empty:
-        return series
+def format_value(val, dtype):
+    if pd.isna(val):
+        return "n/a"
     try:
-        s = series.resample('M').last() if series.index.inferred_freq is None else series
+        if dtype == "pct":
+            return f"{val:.1f}%"
+        elif dtype == "int":
+            return f"{val:,.0f}"
+        elif dtype == "float1":
+            return f"{val:.1f}"
+        else:
+            return f"{val}"
     except Exception:
-        s = series
-    return s.pct_change(periods=12) * 100
+        return str(val)
 
-# --- Sidebar controls ---
-st.sidebar.header("Chart Controls")
-global_timeframe = st.sidebar.selectbox("Global timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
-st.sidebar.markdown("Heatmap uses *latest value vs long-term average*. Click any card to expand a full chart.")
+def z_to_color(z, vmin=-2.5, vmax=2.5, colorscale=pc.diverging.RdYlGn):
+    if pd.isna(z):
+        return "white"
+    t = (z - vmin) / (vmax - vmin)
+    t = max(0.0, min(1.0, t))
+    hexcol = pc.sample_colorscale(colorscale, [t])[0]
+    return hexcol
 
-# Initialize session_state for expanders (stable across reruns)
-if "expand_map" not in st.session_state:
-    st.session_state.expand_map = {}
-
-# --- Page ---
-st.title("Macro Snapshot — Heatmap & Drillable Charts")
-st.markdown("Green = better than long-term average • Red = worse than long-term average. Click a card to open the full interactive chart and per-chart timeframe.")
-
-# --- Heatmap: long-term z-scores ---
-st.subheader("Snapshot: vs Long-Term Average (z-scores)")
-rows = []
+# --- build quarterly table for each series ---
+all_quarters = set()
+series_q_map = {}
 for name, s in data.items():
-    if name not in INDICATOR_DIRECTION:
-        continue
-    z = compute_long_term_zscore(s, INDICATOR_DIRECTION[name])
-    latest = s.dropna().iloc[-1] if not s.empty else np.nan
-    rows.append({"Indicator": name, "Z-Score": z, "Latest": latest})
+    if name == "ISM Manufacturing PMI":
+        s2 = ism_series
+    else:
+        s2 = s
+    q = make_quarterly_series(s2)
+    series_q_map[name] = q
+    all_quarters.update(q.index)
 
-heat_df = pd.DataFrame(rows).set_index("Indicator").sort_index()
+if not ism_series.empty and "ISM Manufacturing PMI" not in series_q_map:
+    q = make_quarterly_series(ism_series)
+    series_q_map["ISM Manufacturing PMI"] = q
+    all_quarters.update(q.index)
 
-if heat_df.empty:
-    st.write("Heatmap data unavailable")
+if not all_quarters:
+    st.error("No quarterly data available.")
+    st.stop()
+
+quarter_index = sorted(list(all_quarters))
+quarter_labels = [to_quarter_label(q) for q in quarter_index]
+
+reported_df = pd.DataFrame(index=list(series_q_map.keys()), columns=quarter_labels, dtype=object)
+z_df = pd.DataFrame(index=list(series_q_map.keys()), columns=quarter_labels, dtype=float)
+
+for name, qseries in series_q_map.items():
+    direction = INDICATOR_DIRECTION.get(name, +1)
+    zseries = compute_long_term_z(qseries, direction)
+    for idx, q_ts in enumerate(quarter_index):
+        label = quarter_labels[idx]
+        if q_ts in qseries.index:
+            val = qseries.loc[q_ts]
+            dtype = DISPLAY_TYPE.get(name, "float1")
+            reported_df.loc[name, label] = format_value(val, dtype)
+            z_df.loc[name, label] = zseries.loc[q_ts] if q_ts in zseries.index else np.nan
+        else:
+            reported_df.loc[name, label] = "n/a"
+            z_df.loc[name, label] = np.nan
+
+# Prepare Plotly table inputs
+table_header = ["Indicator"] + quarter_labels
+
+cell_text = []
+row_names = list(reported_df.index)
+for r in row_names:
+    row = [r] + [reported_df.loc[r, col] for col in quarter_labels]
+    cell_text.append(row)
+
+cells_color = []
+for r in row_names:
+    row_colors = ["#f7f7f7"]
+    for col in quarter_labels:
+        z = z_df.loc[r, col]
+        color = z_to_color(z, vmin=-2.5, vmax=2.5)
+        row_colors.append(color)
+    cells_color.append(row_colors)
+
+cols_text = list(zip(*cell_text))
+cols_color = list(zip(*cells_color))
+cols_text = [list(c) for c in cols_text]
+cols_color = [list(c) for c in cols_color]
+
+# Highlight most recent quarter header
+num_quarters = len(quarter_labels)
+# header colors: first column dark, middle columns light, last column highlighted
+header_colors = ["#333333"] + ["#f0f0f0"] * (num_quarters - 1)
+if num_quarters >= 1:
+    header_colors[-1] = "#cfe2f3"  # light blue for most recent quarter
+
+# Build Plotly table
+fig_table = go.Figure(data=[go.Table(
+    header=dict(values=table_header,
+                fill_color=header_colors,
+                font=dict(color=["white"] + ["#111111"] * num_quarters, size=12),
+                align="center"),
+    cells=dict(values=cols_text,
+               fill_color=cols_color,
+               align="center",
+               font=dict(color=["#111111"] * (num_quarters+1), size=11),
+               height= thirty := 30)
+)])
+
+# Adjust width and height for horizontal scroll in Streamlit
+table_width = max(1000, 120 * num_quarters)
+fig_table.update_layout(margin=dict(l=10, r=10, t=10, b=10), width=table_width, height=420)
+
+# Page
+st.title("Quarterly Values Table — colored by long-term z-score")
+st.markdown("Numbers are **reported values**. Colors show distance from the series' long-run average (green = better, red = worse). Scroll horizontally to view older quarters. Column names show quarter and year like `q42024` (most recent quarter on the right).")
+
+st.plotly_chart(fig_table, use_container_width=True)
+
+# Legend (z-score ranges)
+st.markdown("")
+legend_html = """
+<div style="display:flex;gap:12px;align-items:center;">
+  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
+    <div style="width:18px;height:18px;background:#a50026;border:1px solid #000;"></div><div><b>&lt;= -2.0</b><br><small>Much worse vs history</small></div>
+  </div>
+  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
+    <div style="width:18px;height:18px;background:#f46d43;border:1px solid #000;"></div><div><b>-2.0 to -1.0</b><br><small>Worse</small></div>
+  </div>
+  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
+    <div style="width:18px;height:18px;background:#fee08b;border:1px solid #000;"></div><div><b>-1.0 to +1.0</b><br><small>Near normal</small></div>
+  </div>
+  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
+    <div style="width:18px;height:18px;background:#d9ef8b;border:1px solid #000;"></div><div><b>+1.0 to +2.0</b><br><small>Better</small></div>
+  </div>
+  <div style="display:flex;flex-direction:row;gap:6px;align-items:center;">
+    <div style="width:18px;height:18px;background:#006837;border:1px solid #000;"></div><div><b>&gt;= +2.0</b><br><small>Much better vs history</small></div>
+  </div>
+</div>
+"""
+st.markdown(legend_html, unsafe_allow_html=True)
+
+# --- Below: single-chart selector (one chart at a time) ---
+st.markdown("---")
+st.subheader("Single indicator chart (select one)")
+indicator_options = list(series_q_map.keys())
+selected = st.selectbox("Select indicator", indicator_options, index=indicator_options.index("CPI") if "CPI" in indicator_options else 0)
+
+# timeframe for chart
+tf = st.selectbox("Chart timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
+
+def timeframe_cutoff(series_q, timeframe_key):
+    if series_q.empty:
+        return series_q
+    last = series_q.index.max()
+    if timeframe_key == "1Y":
+        cutoff = last - pd.DateOffset(years=1)
+    elif timeframe_key == "3Y":
+        cutoff = last - pd.DateOffset(years=3)
+    elif timeframe_key == "5Y":
+        cutoff = last - pd.DateOffset(years=5)
+    elif timeframe_key == "10Y":
+        cutoff = last - pd.DateOffset(years=10)
+    else:
+        cutoff = pd.Timestamp("1900-01-01")
+    return series_q[series_q.index >= cutoff]
+
+if selected == "ISM Manufacturing PMI":
+    ser = ism_series
 else:
-    # Build an Nx1 matrix for px.imshow (one column: Z-Score)
-    zvals = heat_df[["Z-Score"]].fillna(0).values
-    fig = px.imshow(
-        zvals,
-        x=["vs long-term avg"],
-        y=heat_df.index.tolist(),
-        color_continuous_scale="RdYlGn",
-        zmin=-2.5,
-        zmax=2.5,
-        labels={"x": "", "y": "Indicator", "color": "z-score"},
-        aspect="auto"
-    )
-    # add numeric annotations (rounded z and latest value)
-    annot_text = [[f"z={heat_df['Z-Score'].loc[idx]:.2f}\nval={heat_df['Latest'].loc[idx]:.2f}" if not np.isnan(heat_df['Z-Score'].loc[idx]) else "n/a" ] for idx in heat_df.index]
-    fig.update_traces(text=annot_text, texttemplate="%{text}", textfont_size=11)
-    fig.update_layout(height=420, margin=dict(l=140, r=20, t=40, b=20), title="Green = better than historical norm • Red = worse")
+    ser = data.get(selected, pd.Series(dtype=float))
+
+qser = make_quarterly_series(ser)
+qser_tf = timeframe_cutoff(qser, tf)
+
+if qser_tf.empty:
+    st.write("No data available for this indicator.")
+else:
+    df_plot = qser_tf.reset_index()
+    df_plot.columns = ["date", "value"]
+    dtype = DISPLAY_TYPE.get(selected, "float1")
+    df_plot["label"] = df_plot["value"].apply(lambda x: format_value(x, dtype))
+    fig = px.line(df_plot, x="date", y="value", markers=True, title=f"{selected} — quarterly values", labels={"value": selected, "date":"Date"})
+    fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>Value: %{customdata}<extra></extra>", customdata=df_plot["label"])
+    fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
     st.plotly_chart(fig, use_container_width=True)
 
-# --- Compact card grid (click to expand) ---
-st.subheader("Indicators (compact cards). Click 'View' to expand a full chart.")
-
-snapshot_items = list(heat_df.index)  # use same indicator order as heatmap
-cards_per_row = 4
-rows_cards = [snapshot_items[i:i+cards_per_row] for i in range(0, len(snapshot_items), cards_per_row)]
-
-for row in rows_cards:
-    cols = st.columns(cards_per_row)
-    for col, name in zip(cols, row):
-        with col:
-            s = data.get(name, pd.Series(dtype=float))
-            # compute a headline metric: 1-year % change if possible, else latest level
-            headline = "n/a"
-            try:
-                s_drop = s.dropna()
-                if len(s_drop) > 12:
-                    prev = s_drop.iloc[-13]
-                    latest = s_drop.iloc[-1]
-                    headline = f"{(latest/prev - 1) * 100:.2f}%"
-                elif not s_drop.empty:
-                    headline = f"{s_drop.iloc[-1]:.2f}"
-            except Exception:
-                headline = "n/a"
-
-            st.markdown(f"**{name}**")
-            st.metric(label="1yr chg / latest", value=headline)
-            # button to toggle expand state
-            btn_key = f"btn_{name}"
-            if st.button(f"View {name}", key=btn_key):
-                st.session_state.expand_map[name] = True
-
-# Render expanders outside the grid for layout stability
-for name in snapshot_items:
-    if st.session_state.expand_map.get(name, False):
-        with st.expander(f"{name} — Full chart (close to collapse)", expanded=True):
-            # allow per-chart timeframe override
-            chart_tf = st.selectbox("Chart timeframe (overrides global)", ["1Y","3Y","5Y","10Y","Max"],
-                                    index=["1Y","3Y","5Y","10Y","Max"].index(global_timeframe),
-                                    key=f"tf_{name}")
-            # pick series (special handling for ISM & spreads)
-            if name == "ISM Manufacturing PMI":
-                s = ism_series
-            elif name in ["10y Treasury", "2y Treasury"]:
-                s = data.get(name, pd.Series(dtype=float))
-            elif name == "10y-2y":
-                # allow computed spread if user adds it (not in snapshot_items by default)
-                s = pd.Series(dtype=float)
-            else:
-                s = data.get(name, pd.Series(dtype=float))
-
-            s_f = filter_series_for_timeframe(s, chart_tf)
-
-            if s_f.empty:
-                st.write("Data unavailable for this indicator")
-            else:
-                # For GDP, show quarterly series/resampled
-                if name == "Real GDP (level)":
-                    s_plot = s_f.resample('Q').last() if s_f.index.inferred_freq is None else s_f
-                    # QoQ annualized
-                    q = s_plot.resample('Q').last()
-                    if len(q) > 1:
-                        qch = (q.pct_change(periods=1) * 4 * 100).dropna()
-                        if not qch.empty:
-                            st.metric("Real GDP QoQ annualized (%)", f"{qch.iloc[-1]:.2f}")
-                # For unemployment show percent and change
-                if name == "Unemployment":
-                    latest = s_f.dropna().iloc[-1] if not s_f.dropna().empty else np.nan
-                    prev = s_f.dropna().iloc[-13] if len(s_f.dropna())>12 else np.nan
-                    if not np.isnan(latest) and not np.isnan(prev):
-                        st.metric("Unemployment (latest)", f"{latest:.2f}%", delta=f"{latest-prev:+.2f}")
-                # Plot interactive line
-                df_plot = s_f.reset_index()
-                df_plot.columns = ["date", "value"]
-                fig = px.line(df_plot, x="date", y="value", title=f"{name} — {chart_tf}", labels={"value": name, "date":"Date"})
-                fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
-                st.plotly_chart(fig, use_container_width=True)
-                # CAGR where meaningful
-                cagr = compute_cagr(s_f)
-                if not np.isnan(cagr):
-                    st.metric(label=f"{name} CAGR ({chart_tf})", value=f"{cagr*100:.2f}%")
-            # close button
-            if st.button("Close", key=f"close_{name}"):
-                st.session_state.expand_map[name] = False
+    # compact table for visible window
+    small_labels = [to_quarter_label(d) for d in df_plot["date"]]
+    small_vals = [format_value(v, dtype) for v in df_plot["value"]]
+    table_df = pd.DataFrame([small_vals], index=[selected], columns=small_labels)
+    st.markdown("**Quarterly values (visible window):**")
+    st.dataframe(table_df.style.set_table_styles([{'selector':'th','props':[('text-align','center')] }]), use_container_width=True)
 
 st.write("---")
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
