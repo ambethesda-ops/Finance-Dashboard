@@ -1,5 +1,10 @@
 # app.py
 # Quarterly text table (values) with color shading by long-term z-score + single selectable interactive chart
+# - Most recent quarter ON THE LEFT (scroll right for older quarters)
+# - Column labels like "Q1 2026"
+# - For CPI, Core CPI, Core PCE, Real GDP, Industrial Production, Real Retail Sales: show YoY % (and shade by YoY z-score)
+# - Bottom chart: when those series are selected, show YoY % growth (not levels)
+# - Removed the second small table under the chart
 # Requires FRED_API_KEY in Streamlit Secrets or environment
 # Requirements: streamlit, pandas, numpy, plotly, fredapi, requests, lxml
 
@@ -14,9 +19,8 @@ from io import StringIO
 import plotly.express as px
 import plotly.colors as pc
 import html as _html
-import plotly.graph_objects as go
 
-st.set_page_config(page_title="Quarterly Macro Table + Single Chart", layout="wide")
+st.set_page_config(page_title="Quarterly Macro Table + Single Chart (YoY for key series)", layout="wide")
 
 # --- FRED / series config ---
 FRED_API_KEY = os.getenv("FRED_API_KEY")
@@ -41,8 +45,18 @@ SERIES = {
     "2y Treasury": "DGS2",
 }
 
+# Series for which we show YoY percent (and shade based on YoY z-score)
+YOY_SERIES = {
+    "CPI",
+    "Core CPI",
+    "Core PCE",
+    "Real GDP (level)",
+    "Industrial Production",
+    "Real Retail Sales (adv)",
+}
+
 # Which indicators where "higher is good" (+1) vs "higher is bad" (-1)
-# IMPORTANT: direction *multiplies* z-score so green=good, red=bad
+# direction multiplies z-score so green = good and red = bad
 INDICATOR_DIRECTION = {
     "CPI": -1,
     "Core CPI": -1,
@@ -60,13 +74,14 @@ INDICATOR_DIRECTION = {
 
 # Display format: 'pct' => "0.0%", 'float1' => one decimal, 'int' => no decimals
 DISPLAY_TYPE = {
-    "CPI": "float1",
-    "Core CPI": "float1",
-    "Core PCE": "float1",
+    # For YOY_SERIES we'll display pct
+    "CPI": "pct",
+    "Core CPI": "pct",
+    "Core PCE": "pct",
     "5y5y inflation": "pct",
-    "Real GDP (level)": "float1",
-    "Industrial Production": "float1",
-    "Real Retail Sales (adv)": "float1",
+    "Real GDP (level)": "pct",
+    "Industrial Production": "pct",
+    "Real Retail Sales (adv)": "pct",
     "Unemployment": "pct",
     "JOLTS (Job Openings)": "int",
     "Consumer Sentiment (UMich)": "float1",
@@ -74,7 +89,7 @@ DISPLAY_TYPE = {
     "2y Treasury": "pct",
 }
 
-# --- helpers for fetch & transforms ---
+# --- fetch helpers ---
 @st.cache_data(ttl=3600)
 def fetch_series_from_fred(series_id):
     try:
@@ -106,8 +121,9 @@ ism_series = fetch_ism_csv_fallback()
 
 # --- utility functions ---
 def to_quarter_label(ts: pd.Timestamp):
+    # Format like "Q1 2026"
     q = ((ts.month - 1) // 3) + 1
-    return f"q{q}{ts.year}"
+    return f"Q{q} {ts.year}"
 
 def make_quarterly_series(s: pd.Series):
     if s.empty:
@@ -119,7 +135,18 @@ def make_quarterly_series(s: pd.Series):
     q = q.dropna()
     return q
 
+def compute_yoy(series_q: pd.Series):
+    # returns YoY percent series: (value / value.shift(4) - 1) * 100
+    if series_q.empty:
+        return series_q
+    s = series_q.dropna()
+    if s.empty:
+        return s
+    yoy = s.pct_change(periods=4) * 100
+    return yoy
+
 def compute_long_term_z(series_q: pd.Series, direction: int, min_obs=20):
+    # Compute z-scores of the series_q (long-run mean/std) and multiply by direction
     s = series_q.dropna()
     if s.empty or len(s) < min_obs:
         return pd.Series(index=series_q.index, data=[np.nan]*len(series_q))
@@ -166,7 +193,7 @@ for name, s in data.items():
     series_q_map[name] = q
     all_quarters.update(q.index)
 
-# include ISM if present but not in series map
+# include ISM explicitly if found
 if not ism_series.empty and "ISM Manufacturing PMI" not in series_q_map:
     q = make_quarterly_series(ism_series)
     series_q_map["ISM Manufacturing PMI"] = q
@@ -176,46 +203,67 @@ if not all_quarters:
     st.error("No quarterly data available.")
     st.stop()
 
-# sort quarters oldest -> newest (user scrolls left to older history)
-quarter_index = sorted(list(all_quarters))
+# sort quarters NEWEST -> OLDEST so newest appears on the LEFT
+quarter_index = sorted(list(all_quarters), reverse=True)
 quarter_labels = [to_quarter_label(q) for q in quarter_index]
 
+# prepare reported values and z-scores; for YOY_SERIES show YoY percent values and shade by YoY z
 reported_df = pd.DataFrame(index=list(series_q_map.keys()), columns=quarter_labels, dtype=object)
 z_df = pd.DataFrame(index=list(series_q_map.keys()), columns=quarter_labels, dtype=float)
 
+# Precompute yoy series for YOY_SERIES to avoid recomputing in loop
+yoy_map = {}
+for name, qseries in series_q_map.items():
+    if name in YOY_SERIES:
+        yoy_map[name] = compute_yoy(qseries)
+    else:
+        yoy_map[name] = pd.Series(dtype=float)
+
 for name, qseries in series_q_map.items():
     direction = INDICATOR_DIRECTION.get(name, +1)
-    zseries = compute_long_term_z(qseries, direction)
+    # compute series used for shading (z): YoY for selected series, else level
+    if name in YOY_SERIES:
+        zseries = compute_long_term_z(yoy_map[name], direction)
+    else:
+        zseries = compute_long_term_z(qseries, direction)
+
+    # fill reported_df: for YOY_SERIES show YoY%, else show reported level formatted
     for idx, q_ts in enumerate(quarter_index):
         label = quarter_labels[idx]
         if q_ts in qseries.index:
-            val = qseries.loc[q_ts]
-            dtype = DISPLAY_TYPE.get(name, "float1")
-            reported_df.loc[name, label] = format_value(val, dtype)
-            z_df.loc[name, label] = zseries.loc[q_ts] if q_ts in zseries.index else np.nan
+            if name in YOY_SERIES:
+                yoy_val = np.nan
+                if q_ts in yoy_map[name].index:
+                    yoy_val = yoy_map[name].loc[q_ts]
+                reported_df.loc[name, label] = format_value(yoy_val, "pct") if (not pd.isna(yoy_val)) else "n/a"
+                z_df.loc[name, label] = zseries.loc[q_ts] if q_ts in zseries.index else np.nan
+            else:
+                val = qseries.loc[q_ts]
+                dtype = DISPLAY_TYPE.get(name, "float1")
+                reported_df.loc[name, label] = format_value(val, dtype)
+                z_df.loc[name, label] = zseries.loc[q_ts] if q_ts in zseries.index else np.nan
         else:
             reported_df.loc[name, label] = "n/a"
             z_df.loc[name, label] = np.nan
 
 # -------------------------
-# Render table as HTML (scrollable) instead of Plotly table (avoids overlapping text)
+# Render HTML table (scrollable). Newest on LEFT.
 # -------------------------
-
-def render_html_table(reported_df, z_df, quarter_labels, highlight_last=True, cell_font_size=11, col_min_width=100, name_col_width=220):
-    # header row
+def render_html_table(reported_df, z_df, quarter_labels, highlight_first=True, cell_font_size=11, col_min_width=100, name_col_width=240):
+    # header: Indicator + quarter columns (newest left)
     header_cells = ['<th style="position: sticky; left:0; background:#333333; color:white; z-index:2; padding:8px;">Indicator</th>']
     for i, q in enumerate(quarter_labels):
-        if highlight_last and i == len(quarter_labels) - 1:
+        # highlight most recent column (first column in list)
+        if highlight_first and i == 0:
             header_cells.append(f'<th style="background:#cfe2f3; min-width:{col_min_width}px; white-space:nowrap; padding:8px;">{_html.escape(q)}</th>')
         else:
             header_cells.append(f'<th style="background:#f0f0f0; min-width:{col_min_width}px; white-space:nowrap; padding:8px;">{_html.escape(q)}</th>')
     header_html = "<tr>" + "".join(header_cells) + "</tr>"
 
-    # body rows
     body_rows = []
     for idx in reported_df.index:
         row_html = []
-        # first cell: indicator name (sticky)
+        # sticky indicator name
         row_html.append(f'<td style="position: sticky; left:0; background:#f7f7f7; min-width:{name_col_width}px; text-align:left; padding:8px;">{_html.escape(idx)}</td>')
         for col in quarter_labels:
             txt = reported_df.loc[idx, col] if col in reported_df.columns else "n/a"
@@ -235,14 +283,14 @@ def render_html_table(reported_df, z_df, quarter_labels, highlight_last=True, ce
     """
     return table_html
 
-# Render table
+# Render page header and table
 st.title("Quarterly Values Table — colored by long-term z-score")
-st.markdown("Numbers are **reported values**. Colors show distance from the series' long-run average (green = better, red = worse). Scroll horizontally to view older quarters. Column names show quarter and year like `q42024` (most recent quarter on the right).")
+st.markdown("Numbers show reported values (for key series the table shows YoY %). Colors show distance from the series' long-run average (green = better, red = worse). Scroll horizontally to view older quarters. Column headers read like 'Q1 2026' (most recent quarter is on the left).")
 
-html_table = render_html_table(reported_df, z_df, quarter_labels, highlight_last=True, cell_font_size=11, col_min_width=100, name_col_width=220)
+html_table = render_html_table(reported_df, z_df, quarter_labels, highlight_first=True, cell_font_size=11, col_min_width=100, name_col_width=240)
 st.markdown(html_table, unsafe_allow_html=True)
 
-# Legend (z-score ranges)
+# Legend
 st.markdown("")
 legend_html = """
 <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;">
@@ -255,17 +303,16 @@ legend_html = """
 """
 st.markdown(legend_html, unsafe_allow_html=True)
 
-# --- Below: single-chart selector (one chart at a time) ---
+# --- Single indicator chart (one at a time) ---
 st.markdown("---")
 st.subheader("Single indicator chart (select one)")
 indicator_options = list(series_q_map.keys())
-# default to CPI if present
 default_idx = 0
 if "CPI" in indicator_options:
     default_idx = indicator_options.index("CPI")
 selected = st.selectbox("Select indicator", indicator_options, index=default_idx)
 
-# timeframe for chart
+# timeframe selector
 tf = st.selectbox("Chart timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
 
 def timeframe_cutoff(series_q, timeframe_key):
@@ -296,21 +343,31 @@ qser_tf = timeframe_cutoff(qser, tf)
 if qser_tf.empty:
     st.write("No data available for this indicator.")
 else:
-    df_plot = qser_tf.reset_index()
-    df_plot.columns = ["date", "value"]
-    dtype = DISPLAY_TYPE.get(selected, "float1")
-    df_plot["label"] = df_plot["value"].apply(lambda x: format_value(x, dtype))
-    fig = px.line(df_plot, x="date", y="value", markers=True, title=f"{selected} — quarterly values", labels={"value": selected, "date":"Date"})
-    fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>Value: %{customdata}<extra></extra>", customdata=df_plot["label"])
-    fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
-    st.plotly_chart(fig, use_container_width=True)
+    # If the selected series is in YOY_SERIES, show YoY percent line
+    if selected in YOY_SERIES:
+        yseries = compute_yoy(qser_tf).dropna()
+        if yseries.empty:
+            st.write("No YoY data available for this timeframe.")
+        else:
+            df_plot = yseries.reset_index()
+            df_plot.columns = ["date", "yoy"]
+            fig = px.line(df_plot, x="date", y="yoy", markers=True, title=f"{selected} — YoY %", labels={"yoy":"YoY %", "date":"Date"})
+            fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>YoY: %{y:.2f}%<extra></extra>")
+            fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        # plot level series for non-YOY
+        df_plot = qser_tf.reset_index()
+        df_plot.columns = ["date", "value"]
+        dtype = DISPLAY_TYPE.get(selected, "float1")
+        df_plot["label"] = df_plot["value"].apply(lambda x: format_value(x, dtype))
+        fig = px.line(df_plot, x="date", y="value", markers=True, title=f"{selected} — quarterly values", labels={"value": selected, "date":"Date"})
+        fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>Value: %{customdata}<extra></extra>", customdata=df_plot["label"])
+        fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
+        st.plotly_chart(fig, use_container_width=True)
 
-    # compact table for visible window
-    small_labels = [to_quarter_label(d) for d in df_plot["date"]]
-    small_vals = [format_value(v, dtype) for v in df_plot["value"]]
-    table_df = pd.DataFrame([small_vals], index=[selected], columns=small_labels)
-    st.markdown("**Quarterly values (visible window):**")
-    st.dataframe(table_df.style.set_table_styles([{'selector':'th','props':[('text-align','center')] }]), use_container_width=True)
+# (Removed the extra compact table below the chart per request)
 
 st.write("---")
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
