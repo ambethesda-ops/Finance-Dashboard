@@ -1,7 +1,8 @@
 streamlit
 pandas
 numpy
-matplotlib
+plotly
 fredapi
 requests
 lxml
+
