@@ -1,5 +1,5 @@
 # app.py
-# Streamlit macro dashboard — interactive Plotly + CAGR + timeframe selector
+# Interactive macro dashboard: color-coded long-term z-score heatmap + compact cards + drillable charts
 # Requires FRED_API_KEY environment variable (Streamlit Secrets or env)
 # requirements: streamlit, pandas, numpy, plotly, fredapi, requests, lxml
 
@@ -13,9 +13,9 @@ import requests
 from io import StringIO
 import plotly.express as px
 
-st.set_page_config(page_title="12-Chart US Macro Dashboard", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Macro Snapshot — Heatmap + Charts", layout="wide", initial_sidebar_state="expanded")
 
-# --- Configuration & FRED ---
+# --- FRED setup ---
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 if not FRED_API_KEY:
     st.warning("Set FRED_API_KEY environment variable (get one at https://fred.stlouisfed.org)")
@@ -23,7 +23,7 @@ if not FRED_API_KEY:
 
 fred = Fred(api_key=FRED_API_KEY)
 
-# Series mapping
+# --- Series mapping (canonical FRED IDs) ---
 SERIES = {
     "CPI": "CPIAUCSL",
     "Core CPI": "CPILFESL",
@@ -39,12 +39,27 @@ SERIES = {
     "2y Treasury": "DGS2",
 }
 
-# Cache FRED series for 1 hour
+# Directionality: +1 means higher = good, -1 means higher = bad
+INDICATOR_DIRECTION = {
+    "CPI": -1,
+    "Core CPI": -1,
+    "Core PCE": -1,
+    "5y5y inflation": -1,
+    "Real GDP (level)": +1,
+    "Industrial Production": +1,
+    "Real Retail Sales (adv)": +1,
+    "Unemployment": -1,
+    "JOLTS (Job Openings)": +1,
+    "Consumer Sentiment (UMich)": +1,
+    "10y Treasury": -1,
+    "2y Treasury": -1,
+}
+
+# --- Fetching helpers ---
 @st.cache_data(ttl=3600)
 def fetch_fred(series_id):
     try:
         s = fred.get_series(series_id).dropna()
-        # ensure datetime index and sort
         s.index = pd.to_datetime(s.index)
         s = s.sort_index()
         return s
@@ -54,24 +69,20 @@ def fetch_fred(series_id):
 
 @st.cache_data(ttl=3600)
 def fetch_ism_csv_fallback():
-    # Best-effort ISM PMI CSV fallback (may be outdated); keep safe
     try:
-        # Example legacy CSV; if fails, return empty
         ism_url = "https://www.ismworld.org/globalassets/pub/research-and-surveys/rob/rob_legacy_data/2074_ism_manufacturing_pmi.csv"
         r = requests.get(ism_url, timeout=8)
         if r.status_code == 200 and len(r.text) > 200:
             df = pd.read_csv(StringIO(r.text), parse_dates=[0], index_col=0)
             df.index = pd.to_datetime(df.index)
-            # assume first numeric column is PMI
             return df.iloc[:, 0].dropna().sort_index()
     except Exception:
         pass
     return pd.Series(dtype=float)
 
-# load data
-with st.spinner("Fetching data from FRED..."):
+# Load data
+with st.spinner("Fetching FRED series..."):
     data = {name: fetch_fred(sid) for name, sid in SERIES.items()}
-
 ism_series = fetch_ism_csv_fallback()
 
 # --- Timeframe helpers ---
@@ -102,219 +113,159 @@ def compute_cagr(series: pd.Series):
         return np.nan
     return (last_val / first_val) ** (1 / years) - 1
 
+def compute_long_term_zscore(series: pd.Series, direction: int):
+    """
+    Latest z-score vs long-term mean. direction flips sign to make green=good.
+    """
+    s = series.dropna()
+    if len(s) < 24:
+        return np.nan
+    mean = s.mean()
+    std = s.std()
+    if std == 0 or np.isnan(std):
+        return np.nan
+    z = (s.iloc[-1] - mean) / std
+    return z * direction
+
 def yoy(series: pd.Series):
     if series.empty:
         return series
-    # resample monthly if irregular
     try:
         s = series.resample('M').last() if series.index.inferred_freq is None else series
     except Exception:
         s = series
     return s.pct_change(periods=12) * 100
 
-def qoq_annualized(series: pd.Series):
-    if series.empty:
-        return series
-    q = series.resample('Q').last()
-    return (q.pct_change(periods=1) * 100 * 4)
-
-# Sidebar controls
+# --- Sidebar controls ---
 st.sidebar.header("Chart Controls")
-timeframe = st.sidebar.selectbox("Timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
-st.sidebar.markdown("Built with FRED series. Timeframe affects all charts.")
+global_timeframe = st.sidebar.selectbox("Global timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
+st.sidebar.markdown("Heatmap uses *latest value vs long-term average*. Click any card to expand a full chart.")
 
-# Small helper to draw an interactive line plot
-def plot_line(series: pd.Series, title: str, y_label: str = None, show_range_slider: bool = True):
-    if series.empty:
-        st.write("Data unavailable")
-        return
-    df = series.reset_index()
-    df.columns = ["date", "value"]
-    fig = px.line(df, x="date", y="value", title=title, labels={"value": y_label or title, "date":"Date"})
-    if show_range_slider:
-        fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
+# Initialize session_state for expanders (stable across reruns)
+if "expand_map" not in st.session_state:
+    st.session_state.expand_map = {}
+
+# --- Page ---
+st.title("Macro Snapshot — Heatmap & Drillable Charts")
+st.markdown("Green = better than long-term average • Red = worse than long-term average. Click a card to open the full interactive chart and per-chart timeframe.")
+
+# --- Heatmap: long-term z-scores ---
+st.subheader("Snapshot: vs Long-Term Average (z-scores)")
+rows = []
+for name, s in data.items():
+    if name not in INDICATOR_DIRECTION:
+        continue
+    z = compute_long_term_zscore(s, INDICATOR_DIRECTION[name])
+    latest = s.dropna().iloc[-1] if not s.empty else np.nan
+    rows.append({"Indicator": name, "Z-Score": z, "Latest": latest})
+
+heat_df = pd.DataFrame(rows).set_index("Indicator").sort_index()
+
+if heat_df.empty:
+    st.write("Heatmap data unavailable")
+else:
+    # Build an Nx1 matrix for px.imshow (one column: Z-Score)
+    zvals = heat_df[["Z-Score"]].fillna(0).values
+    fig = px.imshow(
+        zvals,
+        x=["vs long-term avg"],
+        y=heat_df.index.tolist(),
+        color_continuous_scale="RdYlGn",
+        zmin=-2.5,
+        zmax=2.5,
+        labels={"x": "", "y": "Indicator", "color": "z-score"},
+        aspect="auto"
+    )
+    # add numeric annotations (rounded z and latest value)
+    annot_text = [[f"z={heat_df['Z-Score'].loc[idx]:.2f}\nval={heat_df['Latest'].loc[idx]:.2f}" if not np.isnan(heat_df['Z-Score'].loc[idx]) else "n/a" ] for idx in heat_df.index]
+    fig.update_traces(text=annot_text, texttemplate="%{text}", textfont_size=11)
+    fig.update_layout(height=420, margin=dict(l=140, r=20, t=40, b=20), title="Green = better than historical norm • Red = worse")
     st.plotly_chart(fig, use_container_width=True)
 
-# --- Page header ---
-st.title("12-Chart US Macro Dashboard — Interactive")
-st.markdown("Use the sidebar to change the timeframe for all charts. CAGR calculates annualized growth over the selected window where meaningful.")
+# --- Compact card grid (click to expand) ---
+st.subheader("Indicators (compact cards). Click 'View' to expand a full chart.")
 
-# Layout: 4 columns per row for the main sections
-cols = st.columns(4)
+snapshot_items = list(heat_df.index)  # use same indicator order as heatmap
+cards_per_row = 4
+rows_cards = [snapshot_items[i:i+cards_per_row] for i in range(0, len(snapshot_items), cards_per_row)]
 
-# --- Inflation row ---
-st.header("Inflation")
-infl_items = ["CPI", "Core CPI", "Core PCE", "5y5y inflation"]
-for i, item in enumerate(infl_items):
-    col = cols[i % 4]
-    with col:
-        s = data[item]
-        s_f = filter_series_for_timeframe(s, timeframe)
-        st.subheader(item)
-        if s.empty:
-            st.write("Data unavailable")
-            continue
+for row in rows_cards:
+    cols = st.columns(cards_per_row)
+    for col, name in zip(cols, row):
+        with col:
+            s = data.get(name, pd.Series(dtype=float))
+            # compute a headline metric: 1-year % change if possible, else latest level
+            headline = "n/a"
+            try:
+                s_drop = s.dropna()
+                if len(s_drop) > 12:
+                    prev = s_drop.iloc[-13]
+                    latest = s_drop.iloc[-1]
+                    headline = f"{(latest/prev - 1) * 100:.2f}%"
+                elif not s_drop.empty:
+                    headline = f"{s_drop.iloc[-1]:.2f}"
+            except Exception:
+                headline = "n/a"
 
-        if item in ["CPI", "Core CPI", "Core PCE"]:
-            # level interactive plot + YoY plot + CAGR
-            plot_line(s_f, f"{item} (Index)", y_label="Index")
-            # compute monthly series for YoY and CAGR
-            s_month = s_f.resample('M').last() if s_f.index.inferred_freq is None else s_f
-            yoy_s = yoy(s_month)
-            if not yoy_s.dropna().empty:
-                plot_line(yoy_s, f"{item} YoY (%)", y_label="YoY %")
-            cagr = compute_cagr(s_month)
-            if not np.isnan(cagr):
-                st.metric(label=f"{item} CAGR ({timeframe})", value=f"{cagr*100:.2f}%")
+            st.markdown(f"**{name}**")
+            st.metric(label="1yr chg / latest", value=headline)
+            # button to toggle expand state
+            btn_key = f"btn_{name}"
+            if st.button(f"View {name}", key=btn_key):
+                st.session_state.expand_map[name] = True
+
+# Render expanders outside the grid for layout stability
+for name in snapshot_items:
+    if st.session_state.expand_map.get(name, False):
+        with st.expander(f"{name} — Full chart (close to collapse)", expanded=True):
+            # allow per-chart timeframe override
+            chart_tf = st.selectbox("Chart timeframe (overrides global)", ["1Y","3Y","5Y","10Y","Max"],
+                                    index=["1Y","3Y","5Y","10Y","Max"].index(global_timeframe),
+                                    key=f"tf_{name}")
+            # pick series (special handling for ISM & spreads)
+            if name == "ISM Manufacturing PMI":
+                s = ism_series
+            elif name in ["10y Treasury", "2y Treasury"]:
+                s = data.get(name, pd.Series(dtype=float))
+            elif name == "10y-2y":
+                # allow computed spread if user adds it (not in snapshot_items by default)
+                s = pd.Series(dtype=float)
             else:
-                st.write("CAGR: n/a")
-        else:
-            # 5y5y inflation level
-            plot_line(s_f, "5y5y Inflation Expectations (%)", y_label="%")
-            cagr = compute_cagr(s_f)
-            st.metric(label=f"5y5y CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
+                s = data.get(name, pd.Series(dtype=float))
 
-# --- Growth row ---
-st.header("Growth")
-gcols = st.columns(4)
+            s_f = filter_series_for_timeframe(s, chart_tf)
 
-# GDP
-with gcols[0]:
-    st.subheader("Real GDP")
-    s = data["Real GDP (level)"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        # show QoQ annualized using full-quarter series within timeframe
-        q = s.resample('Q').last()
-        q_f = filter_series_for_timeframe(q, timeframe)
-        if not q_f.empty and len(q_f) > 1:
-            q_change = (q_f.pct_change(periods=1) * 4 * 100).dropna()
-            st.metric("Real GDP QoQ annualized (%)", f"{q_change.iloc[-1]:.2f}")
-        else:
-            st.metric("Real GDP QoQ annualized (%)", "n/a")
-        plot_line(s_f.resample('Q').last() if not s_f.empty else s_f, "Real GDP (level)", y_label="Real GDP")
-        cagr = compute_cagr(s_f.resample('Q').last() if not s_f.empty else s_f)
-        st.metric(label=f"GDP CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-# ISM PMI (fallback)
-with gcols[1]:
-    st.subheader("ISM Manufacturing PMI")
-    pmi = ism_series
-    pmi_f = filter_series_for_timeframe(pmi, timeframe)
-    if pmi.empty:
-        st.write("ISM PMI not available via fallback CSV. We can add a better source on request.")
-    else:
-        plot_line(pmi_f, "ISM Manufacturing PMI", y_label="PMI")
-        cagr = compute_cagr(pmi_f)
-        st.metric(label=f"PMI CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-# Industrial Production
-with gcols[2]:
-    st.subheader("Industrial Production")
-    s = data["Industrial Production"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        plot_line(s_f, "Industrial Production (Index)", y_label="Index")
-        yoy_s = yoy(s_f)
-        if not yoy_s.dropna().empty:
-            plot_line(yoy_s, "Industrial Production YoY (%)", y_label="YoY %")
-        cagr = compute_cagr(s_f)
-        st.metric(label=f"Industrial Production CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-# Retail sales (real)
-with gcols[3]:
-    st.subheader("Real Retail Sales")
-    s = data["Real Retail Sales (adv)"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        plot_line(s_f, "Real Retail Sales (Index)", y_label="Index")
-        yoy_s = yoy(s_f)
-        if not yoy_s.dropna().empty:
-            plot_line(yoy_s, "Real Retail Sales YoY (%)", y_label="YoY %")
-        cagr = compute_cagr(s_f)
-        st.metric(label=f"Retail Sales CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-# --- Consumer & Labor row ---
-st.header("Consumer & Labor")
-lcols = st.columns(4)
-
-with lcols[0]:
-    st.subheader("Unemployment Rate")
-    s = data["Unemployment"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        plot_line(s_f, "Unemployment Rate (%)", y_label="%")
-        # CAGR not meaningful for rate series; show latest & change
-        latest = s_f.dropna().iloc[-1] if not s_f.dropna().empty else np.nan
-        prev = s_f.dropna().iloc[-13] if len(s_f.dropna()) > 12 else np.nan
-        if not np.isnan(latest) and not np.isnan(prev):
-            st.metric("Latest Unemployment (%)", f"{latest:.2f}", delta=f"{(latest-prev):+.2f}")
-
-with lcols[1]:
-    st.subheader("JOLTS - Job Openings")
-    s = data["JOLTS (Job Openings)"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        plot_line(s_f, "Job Openings (total)", y_label="Openings")
-        cagr = compute_cagr(s_f)
-        st.metric(label=f"JOLTS CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-with lcols[2]:
-    st.subheader("Consumer Sentiment (UMich)")
-    s = data["Consumer Sentiment (UMich)"]
-    s_f = filter_series_for_timeframe(s, timeframe)
-    if s.empty:
-        st.write("Data unavailable")
-    else:
-        plot_line(s_f, "UMich Consumer Sentiment", y_label="Index")
-        cagr = compute_cagr(s_f)
-        st.metric(label=f"Sentiment CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-with lcols[3]:
-    st.write("")  # placeholder
-
-# --- Financial Conditions ---
-st.header("Financial Conditions")
-fcols = st.columns(2)
-with fcols[0]:
-    y10 = data["10y Treasury"]
-    y2 = data["2y Treasury"]
-    if y10.empty or y2.empty:
-        st.write("Treasury yields data unavailable")
-    else:
-        df = pd.concat([y10, y2], axis=1).dropna()
-        df.columns = ["DGS10", "DGS2"]
-        df["10y-2y"] = df["DGS10"] - df["DGS2"]
-        df_f = filter_series_for_timeframe(df["10y-2y"], timeframe)
-        if df_f.empty:
-            st.write("Spread data unavailable for timeframe")
-        else:
-            # display last spread in bps
-            latest = df_f.iloc[-1]
-            st.metric("10y − 2y (bps)", f"{latest*100:.1f}")
-            # interactive plot
-            plot_line(df_f*100, "10y − 2y (basis points)", y_label="bps")
-            cagr = compute_cagr(df_f)
-            st.metric(label=f"10y-2y CAGR ({timeframe})", value=(f"{cagr*100:.2f}%" if not np.isnan(cagr) else "n/a"))
-
-with fcols[1]:
-    st.write("Notes & tips")
-    st.markdown("""
-    - Timeframe selector affects all charts.  
-    - CAGR is annualized and computed on the selected window; for rates and survey indices interpret CAGR cautiously.  
-    - ISM PMI is a best-effort CSV fallback; we can add a better ingestion if preferred.  
-    - If you want YoY instead of level for any series, we can add toggles per-chart.
-    """)
+            if s_f.empty:
+                st.write("Data unavailable for this indicator")
+            else:
+                # For GDP, show quarterly series/resampled
+                if name == "Real GDP (level)":
+                    s_plot = s_f.resample('Q').last() if s_f.index.inferred_freq is None else s_f
+                    # QoQ annualized
+                    q = s_plot.resample('Q').last()
+                    if len(q) > 1:
+                        qch = (q.pct_change(periods=1) * 4 * 100).dropna()
+                        if not qch.empty:
+                            st.metric("Real GDP QoQ annualized (%)", f"{qch.iloc[-1]:.2f}")
+                # For unemployment show percent and change
+                if name == "Unemployment":
+                    latest = s_f.dropna().iloc[-1] if not s_f.dropna().empty else np.nan
+                    prev = s_f.dropna().iloc[-13] if len(s_f.dropna())>12 else np.nan
+                    if not np.isnan(latest) and not np.isnan(prev):
+                        st.metric("Unemployment (latest)", f"{latest:.2f}%", delta=f"{latest-prev:+.2f}")
+                # Plot interactive line
+                df_plot = s_f.reset_index()
+                df_plot.columns = ["date", "value"]
+                fig = px.line(df_plot, x="date", y="value", title=f"{name} — {chart_tf}", labels={"value": name, "date":"Date"})
+                fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)))
+                st.plotly_chart(fig, use_container_width=True)
+                # CAGR where meaningful
+                cagr = compute_cagr(s_f)
+                if not np.isnan(cagr):
+                    st.metric(label=f"{name} CAGR ({chart_tf})", value=f"{cagr*100:.2f}%")
+            # close button
+            if st.button("Close", key=f"close_{name}"):
+                st.session_state.expand_map[name] = False
 
 st.write("---")
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
