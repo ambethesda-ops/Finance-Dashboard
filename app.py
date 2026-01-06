@@ -1,9 +1,9 @@
 # app.py
 # Macro Indicators Heat Map
-# - Bucket header names rendered into the left sticky indicator column (locked)
-# - Column header remains sticky at top:0
-# - Only behavior change: bucket names show in left locked column (bold + underlined)
-# Replace your existing app.py with this file.
+# - "Indicator" header locked at top when scrolling vertically
+# - Bucket labels rendered in left sticky column (locked horizontally)
+# - First bucket renamed to "Inflation"
+# - Minimal changes only (preserves previous behavior otherwise)
 
 import os
 from datetime import datetime
@@ -37,10 +37,11 @@ def fetch_series(series_id):
 
 # -----------------------
 # Buckets + indicators
-# (New Vehicle Sales moved to Growth / Activity per prior change)
+# (New Vehicle Sales remains in Growth / Activity)
+# First bucket renamed to "Inflation"
 # -----------------------
 BUCKETS = {
-    "Inflation & Expectations": {
+    "Inflation": {
         "CPI": "CPIAUCSL",
         "Core CPI": "CPILFESL",
         "Core PCE": "PCEPILFE",
@@ -139,18 +140,18 @@ labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
 # Render single combined table
-#  - Column header row sticky at top:0
+#  - Column header row sticky at top:0 (Indicator header cell also top:0,left:0)
 #  - Leftmost indicator column sticky
-#  - Bucket header text placed into the left sticky cell (so bucket label remains locked)
+#  - Bucket labels placed into left sticky column (so they remain visible when horizontally scrolled)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 COL_W = 140
 IND_W = 320
 
-# Column header row (sticky at top:0)
+# Column header row (sticky at top:0). Make the "Indicator" cell also sticky at top:0,left:0
 header = (
-    f'<th style="position:sticky;top:0;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
+    f'<th style="position:sticky;top:0;left:0;z-index:15;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
         f'<th style="position:sticky;top:0;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
         for q in labels
@@ -160,13 +161,12 @@ header = (
 rows_html = []
 for bucket, indicators in BUCKETS.items():
     # Render a bucket header row that places the bucket name inside the left sticky column,
-    # and leaves the quarter columns blank for that row.
+    # so the bucket label is locked in the left column (sticky horizontally).
     bucket_left_cell = (
-        f'<td style="position:sticky; left:0; background:#fafafa; z-index:11;'
+        f'<td style="position:sticky; left:0; background:#fafafa; z-index:14;'
         f'min-width:{IND_W}px; padding:10px; border-right:1px solid #e6e6e6;'
         f'font-weight:700; text-decoration:underline;">{_html.escape(bucket)}</td>'
     )
-    # empty cells for the quarter columns
     empty_quarter_cells = ''.join(
         f'<td style="min-width:{COL_W}px; padding:10px; background:#fafafa; border-bottom:1px solid #eee;"></td>'
         for _ in labels
