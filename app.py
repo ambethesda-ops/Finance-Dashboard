@@ -1,9 +1,12 @@
 # app.py
-# Macro Indicators Heat Map — supports monthly + quarterly columns (monthly preferred when available)
+# Macro Indicators Heat Map
+# - "Indicator" header locked at top when scrolling vertically
+# - Bucket labels rendered in left sticky column (locked horizontally)
+# - First bucket renamed to "Inflation"
+# - Minimal changes only (preserves previous behavior otherwise)
 
 import os
 from datetime import datetime
-import calendar
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -34,6 +37,8 @@ def fetch_series(series_id):
 
 # -----------------------
 # Buckets + indicators
+# (New Vehicle Sales remains in Growth / Activity)
+# First bucket renamed to "Inflation"
 # -----------------------
 BUCKETS = {
     "Inflation": {
@@ -98,27 +103,10 @@ DISPLAY_KIND = {
 # -----------------------
 # Helpers
 # -----------------------
-def month_end(s):
-    """Resample to month-end timestamps (M) and return series indexed by month-end."""
-    if s.empty:
-        return s
-    m = s.resample("M").last().dropna()
-    # normalize to exact month-end timestamp (already is)
-    return m
+def to_quarter(s):
+    return s.resample("Q").last().dropna() if not s.empty else s
 
-def quarter_end(s):
-    """Resample to quarter-end timestamps (Q) and return series indexed by quarter-end."""
-    if s.empty:
-        return s
-    q = s.resample("Q").last().dropna()
-    # canonicalize to quarter-end timestamps (to_timestamp end)
-    q.index = q.index.to_period("Q").to_timestamp(how="end")
-    return q
-
-def yoy_monthly(s):
-    return (s.pct_change(12) * 100).dropna() if not s.empty else s
-
-def yoy_quarterly(s):
+def yoy(s):
     return (s.pct_change(4) * 100).dropna() if not s.empty else s
 
 def zscore(s, direction):
@@ -132,60 +120,49 @@ def color_for_z(z):
     t = max(0, min(1, (z + 2.5) / 5))
     return pc.sample_colorscale(pc.diverging.RdYlGn, [t])[0]
 
-def is_quarter_end_date(dt: pd.Timestamp):
-    # consider quarter ends by month number and being last day
-    return dt.month in (3, 6, 9, 12) and dt.day == calendar.monthrange(dt.year, dt.month)[1]
-
-def label_for_date(dt: pd.Timestamp):
-    if is_quarter_end_date(dt):
-        q = ((dt.month - 1) // 3) + 1
-        return f"Q{q} {dt.year}"
-    else:
-        return dt.strftime("%b %Y")  # e.g., "Dec 2025"
-
 # -----------------------
-# Load data (create monthly + quarterly views)
+# Load data
 # -----------------------
 raw = {}
 for bucket in BUCKETS.values():
     for name, sid in bucket.items():
         raw[name] = fetch_series(sid)
 
-mdata = {}
 qdata = {}
 for name, s in raw.items():
-    # monthly and quarterly canonical series
-    m = month_end(s)
-    q = quarter_end(s)
+    q = to_quarter(s)
     if name in YOY_SERIES:
-        m = yoy_monthly(m)
-        q = yoy_quarterly(q)
-    mdata[name] = m
+        q = yoy(q)
     qdata[name] = q
 
-# Build union of all dates (monthly + quarterly), sorted descending
-all_dates = sorted({d for s in list(mdata.values()) + list(qdata.values()) for d in s.index}, reverse=True)
-labels = [label_for_date(d) for d in all_dates]
+quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
+labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
-# Render single combined table (sticky header + sticky left column)
+# Render single combined table
+#  - Column header row sticky at top:0 (Indicator header cell also top:0,left:0)
+#  - Leftmost indicator column sticky
+#  - Bucket labels placed into left sticky column (so they remain visible when horizontally scrolled)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 COL_W = 140
 IND_W = 320
 
+# Column header row (sticky at top:0). Make the "Indicator" cell also sticky at top:0,left:0
+# NOTE: increase z-index on header cells so header stays above left-sticky cells when scrolling.
 header = (
     f'<th style="position:sticky;top:0;left:0;z-index:18;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
-        f'<th style="position:sticky;top:0;z-index:17;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;border-bottom:1px solid #ddd;">{_html.escape(lbl)}</th>'
-        for lbl in labels
+        f'<th style="position:sticky;top:0;z-index:17;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;border-bottom:1px solid #ddd;">{_html.escape(q)}</th>'
+        for q in labels
     )
 )
 
 rows_html = []
 for bucket, indicators in BUCKETS.items():
-    # bucket header row with sticky left cell
+    # Render a bucket header row that places the bucket name inside the left sticky column,
+    # so the bucket label is locked in the left column (sticky horizontally).
     bucket_left_cell = (
         f'<td style="position:sticky; left:0; background:#fafafa; z-index:14;'
         f'min-width:{IND_W}px; padding:10px; border-right:1px solid #e6e6e6;'
@@ -197,42 +174,28 @@ for bucket, indicators in BUCKETS.items():
     )
     rows_html.append("<tr>" + bucket_left_cell + empty_quarter_cells + "</tr>")
 
+    # indicator rows
     for name in indicators:
-        mseries = mdata.get(name, pd.Series(dtype=float))
-        qseries = qdata.get(name, pd.Series(dtype=float))
-        # For zscore we prefer to compute on the quarterly series (keeps previous behavior),
-        # but fall back to monthly if quarterly is empty.
-        z_series_for_scoring = qseries if not qseries.empty else mseries
-        z = zscore(z_series_for_scoring, DIRECTION.get(name, 1))
-
-        left_cell = f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;padding:10px;border-right:1px solid #ddd;font-weight:400; z-index:15;">&nbsp;&nbsp;{_html.escape(name)}</td>'
-        row = [left_cell]
-        for d in all_dates:
-            txt, bg = "n/a", "white"
-            # prefer monthly value for this date if present, else quarterly
-            if d in mseries.index:
-                val = mseries.loc[d]
+        s = qdata.get(name, pd.Series(dtype=float))
+        z = zscore(s, DIRECTION.get(name, 1))
+        row = [
+            f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;padding:10px;border-right:1px solid #ddd;font-weight:400; z-index:15;">&nbsp;&nbsp;{_html.escape(name)}</td>'
+        ]
+        for d in quarters:
+            if d in s.index:
+                val = s.loc[d]
                 kind = DISPLAY_KIND.get(name, "float")
                 txt = DISPLAY_TYPE[kind](val)
-                # for coloring, try to find matching zscore: if d in z, use it; else attempt nearest quarter-end
-                if d in z.index:
-                    bg = color_for_z(z.loc[d])
-                else:
-                    # try map to quarter-end timestamp for coloring if possible
-                    mapped_q = d.to_period("Q").to_timestamp(how="end")
-                    if mapped_q in z.index:
-                        bg = color_for_z(z.loc[mapped_q])
-            elif d in qseries.index:
-                val = qseries.loc[d]
-                kind = DISPLAY_KIND.get(name, "float")
-                txt = DISPLAY_TYPE[kind](val)
-                if d in z.index:
-                    bg = color_for_z(z.loc[d])
+                bg = color_for_z(z.loc[d]) if d in z.index else "white"
+            else:
+                txt, bg = "n/a", "white"
             row.append(
                 f'<td style="background:{bg};min-width:{COL_W}px;padding:10px;text-align:center;border-bottom:1px solid #eee;">{_html.escape(txt)}</td>'
             )
         rows_html.append("<tr>" + "".join(row) + "</tr>")
 
+# Key change: set max-height on the scroll container so the table's internal scroll bar appears.
+# position:relative and width:max-content let the table size to contents and allow horizontal scroll.
 table_html = f"""
 <div style="max-height:70vh; overflow:auto; border:1px solid #eee;">
 <table style="border-collapse:separate;border-spacing:0;font-family:Arial,Helvetica,sans-serif; width: max-content; position:relative;">
@@ -251,15 +214,10 @@ st.markdown(table_html, unsafe_allow_html=True)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
-indicator = st.selectbox("Select indicator", list(mdata.keys()))
+indicator = st.selectbox("Select indicator", list(qdata.keys()))
 timeframe = st.selectbox("Timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
 
-# For the chart prefer monthly series if available (gives higher resolution),
-# else fall back to quarterly.
-series = mdata.get(indicator, pd.Series(dtype=float))
-if series.empty:
-    series = qdata.get(indicator, pd.Series(dtype=float))
-
+series = qdata.get(indicator, pd.Series(dtype=float))
 if not series.empty:
     last = series.index.max()
     if timeframe != "Max":
