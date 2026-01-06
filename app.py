@@ -1,6 +1,6 @@
 # app.py
-# Macro Indicators Heat Map — final polish: borders, uniform column widths, commas for >1,000
-# Replace existing app.py with this file. Keep requirements.txt unchanged.
+# Macro Indicators Heat Map — synchronized horizontal scrolling across bucket tables
+# Replace your existing app.py with this file.
 
 import os
 from datetime import datetime
@@ -11,6 +11,7 @@ from fredapi import Fred
 import plotly.express as px
 import plotly.colors as pc
 import html as _html
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Macro Indicators Heat Map", layout="wide")
 
@@ -21,7 +22,6 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 if not FRED_API_KEY:
     st.warning("Set FRED_API_KEY in Streamlit Secrets")
     st.stop()
-
 fred = Fred(api_key=FRED_API_KEY)
 
 @st.cache_data(ttl=3600)
@@ -34,7 +34,7 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Series & buckets (ISM removed)
+# Series & buckets
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -80,14 +80,12 @@ DIRECTION = {
     "High Yield OAS": -1, "New Vehicle Sales (proxy)": 1,
 }
 
-# explicit display types for clarity
 DISPLAY_TYPE = {
     "CPI": "pct", "Core CPI": "pct", "Core PCE": "pct", "5y5y inflation (market-implied)": "pct",
     "New Vehicle Sales (proxy)": "float1",
     "Real GDP (level)": "pct", "Industrial Production": "pct", "Real Retail Sales (adv)": "pct",
     "Housing Starts": "int",
     "Unemployment": "pct", "Initial Claims": "int", "JOLTS (Job Openings)": "int", "Real Wages (YoY)": "pct",
-    "Consumer Sentiment (UMich)": "float1",
     "10y Treasury": "pct", "2y Treasury": "pct", "High Yield OAS": "float1",
 }
 
@@ -122,11 +120,9 @@ def format_cell_value(name, val):
         if dtype == "int":
             return f"{int(val):,}"
         if dtype == "float1":
-            # if large number, include commas for readability
             if abs(val) >= 1000:
                 return f"{val:,.0f}"
             return f"{val:.1f}"
-        # fallback: if very large, use comma format
         if isinstance(val, (int, np.integer)) or abs(val) >= 1000:
             return f"{val:,.0f}"
         return f"{val:.1f}"
@@ -134,14 +130,13 @@ def format_cell_value(name, val):
         return str(val)
 
 # -----------------------
-# Load data from FRED
+# Load data
 # -----------------------
 raw = {}
 for bucket in BUCKETS.values():
     for name, sid in bucket.items():
         raw[name] = fetch_series(sid)
 
-# Prepare quarterly series (YoY for YOY_SERIES)
 qdata = {}
 for name, s in raw.items():
     q = to_quarter(s)
@@ -149,7 +144,6 @@ for name, s in raw.items():
         q = yoy(q)
     qdata[name] = q
 
-# master quarter list (newest -> left)
 all_quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
 if not all_quarters:
     st.error("No quarterly data available. Check FRED series IDs.")
@@ -157,10 +151,9 @@ if not all_quarters:
 quarter_labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in all_quarters]
 
 # -----------------------
-# UI header
+# Page header + legend
 # -----------------------
 st.title("Macro Indicators Heat Map")
-
 legend_html = """
 <div style="display:flex;gap:14px;align-items:center;margin-bottom:12px;">
   <div style="display:flex;gap:8px;align-items:center;"><div style="width:16px;height:16px;background:#006837;border:1px solid #999"></div><div>Better</div></div>
@@ -171,32 +164,26 @@ legend_html = """
 st.markdown(legend_html, unsafe_allow_html=True)
 
 # -----------------------
-# Table rendering (one table per bucket)
-# Styling: uniform column width, larger indicator column, row borders, sticky left column
+# Build HTML for all bucket tables and sync JS
 # -----------------------
-COL_WIDTH_PX = 140  # width for each quarter column (wide enough for "Q4 2025")
-INDICATOR_COL_WIDTH_PX = 300
+COL_W = 150
+IND_W = 320
 
-def render_bucket_table(bucket_name, indicators):
-    st.subheader(bucket_name)
-    # table header
-    header_cells = [f'<th style="position:sticky; left:0; background:#222; color:white; z-index:5; min-width:{INDICATOR_COL_WIDTH_PX}px; width:{INDICATOR_COL_WIDTH_PX}px; text-align:left; padding:10px;">Indicator</th>']
+bucket_html_blocks = []
+for bucket_name, indicators in BUCKETS.items():
+    # header
+    header_cells = [f'<th style="position:sticky; left:0; background:#222; color:white; z-index:5; min-width:{IND_W}px; width:{IND_W}px; text-align:left; padding:10px;">Indicator</th>']
     for i, q in enumerate(quarter_labels):
         bg = "#cfe2f3" if i == 0 else "#f8f8f8"
-        header_cells.append(f'<th style="background:{bg}; min-width:{COL_WIDTH_PX}px; width:{COL_WIDTH_PX}px; text-align:center; padding:10px;">{_html.escape(q)}</th>')
+        header_cells.append(f'<th style="background:{bg}; min-width:{COL_W}px; width:{COL_W}px; text-align:center; padding:10px;">{_html.escape(q)}</th>')
     header_html = "<tr>" + "".join(header_cells) + "</tr>"
 
-    # body rows
+    # rows
     rows_html = []
-    for name in indicators:
+    for name in indicators.keys():
         s = qdata.get(name, pd.Series(dtype=float))
-        # compute z based on underlying series before formatting
-        if name in YOY_SERIES:
-            z_series = zscore(s, DIRECTION.get(name, 1))
-        else:
-            z_series = zscore(s, DIRECTION.get(name, 1))
-        # left sticky label
-        row_cells = [f'<td style="position:sticky; left:0; background:#fff; z-index:4; min-width:{INDICATOR_COL_WIDTH_PX}px; width:{INDICATOR_COL_WIDTH_PX}px; padding:10px; border-right:1px solid #e6e6e6; font-weight:500;">{_html.escape(name)}</td>']
+        z_series = zscore(s, DIRECTION.get(name, 1))
+        row_cells = [f'<td style="position:sticky; left:0; background:#fff; z-index:4; min-width:{IND_W}px; width:{IND_W}px; padding:10px; border-right:1px solid #e6e6e6; font-weight:600;">{_html.escape(name)}</td>']
         for d in all_quarters:
             if d in s.index:
                 val = s.loc[d]
@@ -205,25 +192,60 @@ def render_bucket_table(bucket_name, indicators):
             else:
                 display = "n/a"
                 bg = "white"
-            row_cells.append(f'<td style="background:{bg}; min-width:{COL_WIDTH_PX}px; width:{COL_WIDTH_PX}px; text-align:center; padding:10px; border-bottom:1px solid #e9e9e9;">{_html.escape(display)}</td>')
+            row_cells.append(f'<td style="background:{bg}; min-width:{COL_W}px; width:{COL_W}px; text-align:center; padding:10px; border-bottom:1px solid #e9e9e9;">{_html.escape(display)}</td>')
         rows_html.append("<tr>" + "".join(row_cells) + "</tr>")
 
-    table_html = f"""
-    <div style="overflow-x:auto; margin-bottom:12px;">
-      <table style="border-collapse:separate; border-spacing:0; font-family:Arial, Helvetica, sans-serif;">
-        <thead>{header_html}</thead>
-        <tbody>{"".join(rows_html)}</tbody>
-      </table>
+    table_html = f'''
+    <div style="margin-bottom:18px;">
+      <h3 style="margin:8px 0 6px 0;">{_html.escape(bucket_name)}</h3>
+      <div class="sync-scroll" style="overflow-x:auto; border:1px solid #eee; padding:6px;">
+        <table style="border-collapse:separate; border-spacing:0; font-family:Arial, Helvetica, sans-serif;">
+          <thead>{header_html}</thead>
+          <tbody>{"".join(rows_html)}</tbody>
+        </table>
+      </div>
     </div>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
+    '''
+    bucket_html_blocks.append(table_html)
 
-# render each bucket in order
-for bucket_name, indicators in BUCKETS.items():
-    render_bucket_table(bucket_name, list(indicators.keys()))
+# Combine all tables into one HTML blob and add JS to sync scrollLeft across .sync-scroll elements
+full_html = """
+<html>
+  <head>
+    <meta charset="utf-8"/>
+  </head>
+  <body>
+    <div style="font-family:Arial, Helvetica, sans-serif;">
+      {tables}
+    </div>
+    <script>
+      (function() {{
+        const containers = Array.from(document.getElementsByClassName('sync-scroll'));
+        if (containers.length < 2) return;
+        let isSyncing = false;
+        containers.forEach(c => {{
+          c.addEventListener('scroll', function() {{
+            if (isSyncing) return;
+            isSyncing = true;
+            const left = c.scrollLeft;
+            containers.forEach(other => {{
+              if (other !== c) other.scrollLeft = left;
+            }});
+            // small timeout to avoid recursion
+            setTimeout(()=>{{ isSyncing = false; }}, 20);
+          }});
+        }});
+      }})();
+    </script>
+  </body>
+</html>
+""".format(tables="".join(bucket_html_blocks))
+
+# Render the HTML (set height so all tables are visible; Streamlit will scroll as needed)
+components.html(full_html, height=600, scrolling=True)
 
 # -----------------------
-# Bottom single-chart (single line only)
+# Single indicator chart (unchanged)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
