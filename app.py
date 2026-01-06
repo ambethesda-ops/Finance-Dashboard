@@ -1,6 +1,5 @@
 # app.py
-# Macro Indicators Heat Map — bucket headers sticky vertically (visible when scrolling down),
-# not sticky horizontally (so they scroll left/right with the table).
+# Macro Indicators Heat Map — bucket headers locked (sticky) at top; column header just below them
 # Replace your current app.py with this file.
 
 import os
@@ -135,31 +134,34 @@ quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
 labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
-# Render single combined table (bucket header rows STICKY VERTICALLY, non-sticky horizontally)
+# Render single combined table
+#  - Bucket headers LOCKED (sticky at top: 0)
+#  - Column header row sticky below them (top: 48px)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 COL_W = 140
 IND_W = 320
 
-# sticky header cells (top row)
+# Note: bucket headers are sticky at top:0 (z-index high). Column headers are sticky at top:48px.
+# This guarantees bucket headers remain visible (locked), and the column header remains directly underneath.
+
+# Build header row (column headers) but give them top:48px so they sit under bucket header
 header = (
-    f'<th style="position:sticky;top:0;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
+    f'<th style="position:sticky;top:48px;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
-        f'<th style="position:sticky;top:0;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
+        f'<th style="position:sticky;top:48px;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
         for q in labels
     )
 )
 
 rows_html = []
 for bucket, indicators in BUCKETS.items():
-    # bucket header row — STICKY VERTICALLY: position:sticky; top:44px
-    # top:44px chosen so it sits just under the top header row (which is sticky top:0)
-    # it is NOT sticky left, so it will scroll horizontally with table content
+    # bucket header row — LOCKED at top:0
     rows_html.append(
         f'<tr>'
         f'<td colspan="{len(labels)+1}" '
-        f'style="position:sticky; top:96px; z-index:11; background:#fafafa; padding:10px 12px; '
+        f'style="position:sticky; top:0; z-index:14; background:#fafafa; padding:10px 12px; '
         f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
         f'{_html.escape(bucket)}</td></tr>'
     )
@@ -221,4 +223,3 @@ else:
     st.write("No data available for this indicator.")
 
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
