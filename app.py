@@ -1,6 +1,7 @@
 # app.py
-# Macro Indicators Heat Map — single table, bucket headers scroll away on horizontal scroll, bottom chart restored
-# Replace existing app.py with this file.
+# Macro Indicators Heat Map — bucket headers sticky vertically (visible when scrolling down),
+# not sticky horizontally (so they scroll left/right with the table).
+# Replace your current app.py with this file.
 
 import os
 from datetime import datetime
@@ -33,7 +34,7 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Buckets + indicators (unchanged)
+# Buckets + indicators
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -134,7 +135,7 @@ quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
 labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
-# Render single combined table (bucket header rows scroll horizontally)
+# Render single combined table (bucket header rows STICKY VERTICALLY, non-sticky horizontally)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
@@ -143,7 +144,7 @@ IND_W = 320
 
 # sticky header cells (top row)
 header = (
-    f'<th style="position:sticky;top:0;left:0;z-index:10;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
+    f'<th style="position:sticky;top:0;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
         f'<th style="position:sticky;top:0;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
         for q in labels
@@ -152,15 +153,17 @@ header = (
 
 rows_html = []
 for bucket, indicators in BUCKETS.items():
-    # bucket header row (NOT sticky: position static so it scrolls away horizontally)
-    # we render a single td that spans all columns; make sure it's not sticky/anchored
+    # bucket header row — STICKY VERTICALLY: position:sticky; top:44px
+    # top:44px chosen so it sits just under the top header row (which is sticky top:0)
+    # it is NOT sticky left, so it will scroll horizontally with table content
     rows_html.append(
-        f'<tr><td colspan="{len(labels)+1}" '
-        f'style="padding:10px 12px;font-weight:700;text-decoration:underline;background:#fafafa;border-top:1px solid #eaeaea;">'
+        f'<tr>'
+        f'<td colspan="{len(labels)+1}" '
+        f'style="position:sticky; top:44px; z-index:11; background:#fafafa; padding:10px 12px; '
+        f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
         f'{_html.escape(bucket)}</td></tr>'
     )
 
-    # indicator rows (left indicator column is sticky)
     for name in indicators:
         s = qdata.get(name, pd.Series(dtype=float))
         z = zscore(s, DIRECTION.get(name, 1))
@@ -194,7 +197,7 @@ table_html = f"""
 st.markdown(table_html, unsafe_allow_html=True)
 
 # -----------------------
-# Bottom single-indicator chart (restored)
+# Bottom single-indicator chart (unchanged)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
