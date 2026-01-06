@@ -159,7 +159,7 @@ for bucket, indicators in BUCKETS.items():
     rows_html.append(
         f'<tr>'
         f'<td colspan="{len(labels)+1}" '
-        f'style="position:sticky; top:44px; z-index:11; background:#fafafa; padding:10px 12px; '
+        f'style="position:sticky; top:96px; z-index:11; background:#fafafa; padding:10px 12px; '
         f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
         f'{_html.escape(bucket)}</td></tr>'
     )
@@ -221,3 +221,4 @@ else:
     st.write("No data available for this indicator.")
 
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
