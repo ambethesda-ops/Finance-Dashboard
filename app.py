@@ -1,9 +1,9 @@
 # app.py
 # Macro Indicators Heat Map
-# - Only "Inflation & Expectations" bucket header is locked (sticky at top:48px)
-# - Column header (quarters) restored and sticky at top:0
-# - "New Vehicle Sales (proxy)" moved to Growth / Activity
-# - No other layout/logic changes
+# - Bucket header names rendered into the left sticky indicator column (locked)
+# - Column header remains sticky at top:0
+# - Only behavior change: bucket names show in left locked column (bold + underlined)
+# Replace your existing app.py with this file.
 
 import os
 from datetime import datetime
@@ -36,7 +36,8 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Buckets + indicators (New Vehicle Sales moved to Growth / Activity)
+# Buckets + indicators
+# (New Vehicle Sales moved to Growth / Activity per prior change)
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -138,8 +139,9 @@ labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
 # Render single combined table
-#  - Column header row sticky at top:0 (restored)
-#  - ONLY "Inflation & Expectations" bucket header is sticky at top:48px
+#  - Column header row sticky at top:0
+#  - Leftmost indicator column sticky
+#  - Bucket header text placed into the left sticky cell (so bucket label remains locked)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
@@ -157,23 +159,21 @@ header = (
 
 rows_html = []
 for bucket, indicators in BUCKETS.items():
-    # If bucket is "Inflation & Expectations", make its header sticky vertically (top:48px)
-    if bucket == "Inflation & Expectations":
-        rows_html.append(
-            f'<tr>'
-            f'<td colspan="{len(labels)+1}" '
-            f'style="position:sticky; top:48px; z-index:11; background:#fafafa; padding:10px 12px; '
-            f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
-            f'{_html.escape(bucket)}</td></tr>'
-        )
-    else:
-        # normal (non-sticky) bucket header
-        rows_html.append(
-            f'<tr><td colspan="{len(labels)+1}" '
-            f'style="padding:10px 12px; font-weight:700; text-decoration:underline; background:#fafafa; border-top:1px solid #eaeaea;">'
-            f'{_html.escape(bucket)}</td></tr>'
-        )
+    # Render a bucket header row that places the bucket name inside the left sticky column,
+    # and leaves the quarter columns blank for that row.
+    bucket_left_cell = (
+        f'<td style="position:sticky; left:0; background:#fafafa; z-index:11;'
+        f'min-width:{IND_W}px; padding:10px; border-right:1px solid #e6e6e6;'
+        f'font-weight:700; text-decoration:underline;">{_html.escape(bucket)}</td>'
+    )
+    # empty cells for the quarter columns
+    empty_quarter_cells = ''.join(
+        f'<td style="min-width:{COL_W}px; padding:10px; background:#fafafa; border-bottom:1px solid #eee;"></td>'
+        for _ in labels
+    )
+    rows_html.append("<tr>" + bucket_left_cell + empty_quarter_cells + "</tr>")
 
+    # indicator rows
     for name in indicators:
         s = qdata.get(name, pd.Series(dtype=float))
         z = zscore(s, DIRECTION.get(name, 1))
@@ -207,7 +207,7 @@ table_html = f"""
 st.markdown(table_html, unsafe_allow_html=True)
 
 # -----------------------
-# Bottom single-indicator chart (restored)
+# Bottom single-indicator chart (unchanged)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
