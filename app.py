@@ -1,6 +1,6 @@
 # app.py
-# Macro Indicators Heat Map — SINGLE TABLE, bucket headers, frozen top row + left column
-# No JS, no scroll syncing, no extra formatting changes
+# Macro Indicators Heat Map — single table, bucket headers scroll away on horizontal scroll, bottom chart restored
+# Replace existing app.py with this file.
 
 import os
 from datetime import datetime
@@ -21,7 +21,6 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 if not FRED_API_KEY:
     st.warning("Set FRED_API_KEY in Streamlit Secrets")
     st.stop()
-
 fred = Fred(api_key=FRED_API_KEY)
 
 @st.cache_data(ttl=3600)
@@ -34,7 +33,7 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Buckets + indicators
+# Buckets + indicators (unchanged)
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -135,13 +134,14 @@ quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
 labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
-# Render table
+# Render single combined table (bucket header rows scroll horizontally)
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 COL_W = 140
 IND_W = 320
 
+# sticky header cells (top row)
 header = (
     f'<th style="position:sticky;top:0;left:0;z-index:10;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
@@ -151,32 +151,32 @@ header = (
 )
 
 rows_html = []
-
 for bucket, indicators in BUCKETS.items():
-    # bucket header row
+    # bucket header row (NOT sticky: position static so it scrolls away horizontally)
+    # we render a single td that spans all columns; make sure it's not sticky/anchored
     rows_html.append(
         f'<tr><td colspan="{len(labels)+1}" '
-        f'style="font-weight:600;text-decoration:underline;padding:10px;background:#fafafa;">'
+        f'style="padding:10px 12px;font-weight:700;text-decoration:underline;background:#fafafa;border-top:1px solid #eaeaea;">'
         f'{_html.escape(bucket)}</td></tr>'
     )
 
+    # indicator rows (left indicator column is sticky)
     for name in indicators:
         s = qdata.get(name, pd.Series(dtype=float))
         z = zscore(s, DIRECTION.get(name, 1))
         row = [
-            f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;'
-            f'padding:10px;border-right:1px solid #ddd;">&nbsp;&nbsp;{_html.escape(name)}</td>'
+            f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;padding:10px;border-right:1px solid #ddd;font-weight:400;">&nbsp;&nbsp;{_html.escape(name)}</td>'
         ]
         for d in quarters:
             if d in s.index:
                 val = s.loc[d]
-                txt = DISPLAY_TYPE[DISPLAY_KIND[name]](val)
+                kind = DISPLAY_KIND.get(name, "float")
+                txt = DISPLAY_TYPE[kind](val)
                 bg = color_for_z(z.loc[d]) if d in z.index else "white"
             else:
                 txt, bg = "n/a", "white"
             row.append(
-                f'<td style="background:{bg};min-width:{COL_W}px;padding:10px;text-align:center;'
-                f'border-bottom:1px solid #eee;">{_html.escape(txt)}</td>'
+                f'<td style="background:{bg};min-width:{COL_W}px;padding:10px;text-align:center;border-bottom:1px solid #eee;">{_html.escape(txt)}</td>'
             )
         rows_html.append("<tr>" + "".join(row) + "</tr>")
 
@@ -192,5 +192,29 @@ table_html = f"""
 """
 
 st.markdown(table_html, unsafe_allow_html=True)
+
+# -----------------------
+# Bottom single-indicator chart (restored)
+# -----------------------
+st.markdown("---")
+st.subheader("Single indicator chart")
+indicator = st.selectbox("Select indicator", list(qdata.keys()))
+timeframe = st.selectbox("Timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
+
+series = qdata.get(indicator, pd.Series(dtype=float))
+if not series.empty:
+    last = series.index.max()
+    if timeframe != "Max":
+        years = int(timeframe[:-1])
+        cutoff = last - pd.DateOffset(years=years)
+        series = series[series.index >= cutoff]
+    df = series.reset_index()
+    df.columns = ["date", "value"]
+    title = f"{indicator} — YoY %" if indicator in YOY_SERIES else f"{indicator} — Level"
+    fig = px.line(df, x="date", y="value", markers=True, title=title)
+    fig.update_layout(xaxis_rangeslider_visible=False, margin=dict(t=40,b=20))
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.write("No data available for this indicator.")
 
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
