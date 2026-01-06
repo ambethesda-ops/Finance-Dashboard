@@ -1,6 +1,9 @@
 # app.py
-# Macro Indicators Heat Map — bucket headers locked (sticky) at top; column header just below them
-# Replace your current app.py with this file.
+# Macro Indicators Heat Map
+# - Only "Inflation & Expectations" bucket header is locked (sticky at top:48px)
+# - Column header (quarters) restored and sticky at top:0
+# - "New Vehicle Sales (proxy)" moved to Growth / Activity
+# - No other layout/logic changes
 
 import os
 from datetime import datetime
@@ -33,7 +36,7 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Buckets + indicators
+# Buckets + indicators (New Vehicle Sales moved to Growth / Activity)
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -41,9 +44,9 @@ BUCKETS = {
         "Core CPI": "CPILFESL",
         "Core PCE": "PCEPILFE",
         "5y5y inflation (market-implied)": "T5YIFR",
-        "New Vehicle Sales (proxy)": "TOTALSA",
     },
     "Growth / Activity": {
+        "New Vehicle Sales (proxy)": "TOTALSA",
         "Real GDP (level)": "GDPC1",
         "Industrial Production": "INDPRO",
         "Real Retail Sales (adv)": "RRSFS",
@@ -135,36 +138,41 @@ labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in quarters]
 
 # -----------------------
 # Render single combined table
-#  - Bucket headers LOCKED (sticky at top: 0)
-#  - Column header row sticky below them (top: 48px)
+#  - Column header row sticky at top:0 (restored)
+#  - ONLY "Inflation & Expectations" bucket header is sticky at top:48px
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 COL_W = 140
 IND_W = 320
 
-# Note: bucket headers are sticky at top:0 (z-index high). Column headers are sticky at top:48px.
-# This guarantees bucket headers remain visible (locked), and the column header remains directly underneath.
-
-# Build header row (column headers) but give them top:48px so they sit under bucket header
+# Column header row (sticky at top:0)
 header = (
-    f'<th style="position:sticky;top:48px;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
+    f'<th style="position:sticky;top:0;left:0;z-index:12;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
-        f'<th style="position:sticky;top:48px;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
+        f'<th style="position:sticky;top:0;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
         for q in labels
     )
 )
 
 rows_html = []
 for bucket, indicators in BUCKETS.items():
-    # bucket header row — LOCKED at top:0
-    rows_html.append(
-        f'<tr>'
-        f'<td colspan="{len(labels)+1}" '
-        f'style="position:sticky; top:0; z-index:14; background:#fafafa; padding:10px 12px; '
-        f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
-        f'{_html.escape(bucket)}</td></tr>'
-    )
+    # If bucket is "Inflation & Expectations", make its header sticky vertically (top:48px)
+    if bucket == "Inflation & Expectations":
+        rows_html.append(
+            f'<tr>'
+            f'<td colspan="{len(labels)+1}" '
+            f'style="position:sticky; top:48px; z-index:11; background:#fafafa; padding:10px 12px; '
+            f'font-weight:700; text-decoration:underline; border-top:1px solid #eaeaea;">'
+            f'{_html.escape(bucket)}</td></tr>'
+        )
+    else:
+        # normal (non-sticky) bucket header
+        rows_html.append(
+            f'<tr><td colspan="{len(labels)+1}" '
+            f'style="padding:10px 12px; font-weight:700; text-decoration:underline; background:#fafafa; border-top:1px solid #eaeaea;">'
+            f'{_html.escape(bucket)}</td></tr>'
+        )
 
     for name in indicators:
         s = qdata.get(name, pd.Series(dtype=float))
@@ -199,7 +207,7 @@ table_html = f"""
 st.markdown(table_html, unsafe_allow_html=True)
 
 # -----------------------
-# Bottom single-indicator chart (unchanged)
+# Bottom single-indicator chart (restored)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
