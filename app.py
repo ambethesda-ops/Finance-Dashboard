@@ -1,12 +1,6 @@
 # app.py
-# Macro Indicators Heat Map
-# - Separate tables per bucket
-# - Newest quarter on LEFT
-# - YoY % for key growth/inflation series
-# - Real Wages from LES1252881600Q
-# - ISM REMOVED
-# - No duplicate line under chart
-# - Sticky left column fixed
+# Macro Indicators Heat Map — final polish: borders, uniform column widths, commas for >1,000
+# Replace existing app.py with this file. Keep requirements.txt unchanged.
 
 import os
 from datetime import datetime
@@ -40,7 +34,7 @@ def fetch_series(series_id):
         return pd.Series(dtype=float)
 
 # -----------------------
-# Series & buckets
+# Series & buckets (ISM removed)
 # -----------------------
 BUCKETS = {
     "Inflation & Expectations": {
@@ -86,42 +80,68 @@ DIRECTION = {
     "High Yield OAS": -1, "New Vehicle Sales (proxy)": 1,
 }
 
-FORMAT = {
-    "int": lambda x: f"{int(x):,}",
-    "pct": lambda x: f"{x:.1f}%",
-    "float": lambda x: f"{x:.1f}",
+# explicit display types for clarity
+DISPLAY_TYPE = {
+    "CPI": "pct", "Core CPI": "pct", "Core PCE": "pct", "5y5y inflation (market-implied)": "pct",
+    "New Vehicle Sales (proxy)": "float1",
+    "Real GDP (level)": "pct", "Industrial Production": "pct", "Real Retail Sales (adv)": "pct",
+    "Housing Starts": "int",
+    "Unemployment": "pct", "Initial Claims": "int", "JOLTS (Job Openings)": "int", "Real Wages (YoY)": "pct",
+    "Consumer Sentiment (UMich)": "float1",
+    "10y Treasury": "pct", "2y Treasury": "pct", "High Yield OAS": "float1",
 }
 
 # -----------------------
 # Helpers
 # -----------------------
 def to_quarter(s):
-    return s.resample("Q").last().dropna()
+    return s.resample("Q").last().dropna() if not s.empty else s
 
 def yoy(s):
-    return (s.pct_change(4) * 100).dropna()
+    return (s.pct_change(4) * 100).dropna() if not s.empty else s
 
 def zscore(s, direction):
-    if len(s.dropna()) < 20:
-        return s * np.nan
+    if s.empty or len(s.dropna()) < 20:
+        return pd.Series(index=s.index, data=[np.nan] * len(s))
     z = (s - s.mean()) / s.std()
     return z * direction
 
-def color(z):
+def color_for_z(z):
     if pd.isna(z):
         return "white"
-    t = max(0, min(1, (z + 2.5) / 5))
+    t = max(0.0, min(1.0, (z + 2.5) / 5.0))
     return pc.sample_colorscale(pc.diverging.RdYlGn, [t])[0]
 
+def format_cell_value(name, val):
+    if pd.isna(val):
+        return "n/a"
+    dtype = DISPLAY_TYPE.get(name)
+    try:
+        if dtype == "pct":
+            return f"{val:.1f}%"
+        if dtype == "int":
+            return f"{int(val):,}"
+        if dtype == "float1":
+            # if large number, include commas for readability
+            if abs(val) >= 1000:
+                return f"{val:,.0f}"
+            return f"{val:.1f}"
+        # fallback: if very large, use comma format
+        if isinstance(val, (int, np.integer)) or abs(val) >= 1000:
+            return f"{val:,.0f}"
+        return f"{val:.1f}"
+    except Exception:
+        return str(val)
+
 # -----------------------
-# Load data
+# Load data from FRED
 # -----------------------
 raw = {}
 for bucket in BUCKETS.values():
     for name, sid in bucket.items():
         raw[name] = fetch_series(sid)
 
-# Convert to quarterly
+# Prepare quarterly series (YoY for YOY_SERIES)
 qdata = {}
 for name, s in raw.items():
     q = to_quarter(s)
@@ -129,83 +149,101 @@ for name, s in raw.items():
         q = yoy(q)
     qdata[name] = q
 
-# Build master quarter index (newest left)
-all_q = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
-qlabels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in all_q]
+# master quarter list (newest -> left)
+all_quarters = sorted({d for s in qdata.values() for d in s.index}, reverse=True)
+if not all_quarters:
+    st.error("No quarterly data available. Check FRED series IDs.")
+    st.stop()
+quarter_labels = [f"Q{((d.month-1)//3)+1} {d.year}" for d in all_quarters]
 
 # -----------------------
-# UI
+# UI header
 # -----------------------
 st.title("Macro Indicators Heat Map")
 
 legend_html = """
-<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px;">
-  <div style="width:16px;height:16px;background:#006837"></div> Better
-  <div style="width:16px;height:16px;background:#fee08b"></div> Neutral
-  <div style="width:16px;height:16px;background:#a50026"></div> Worse
+<div style="display:flex;gap:14px;align-items:center;margin-bottom:12px;">
+  <div style="display:flex;gap:8px;align-items:center;"><div style="width:16px;height:16px;background:#006837;border:1px solid #999"></div><div>Better</div></div>
+  <div style="display:flex;gap:8px;align-items:center;"><div style="width:16px;height:16px;background:#fee08b;border:1px solid #999"></div><div>Neutral</div></div>
+  <div style="display:flex;gap:8px;align-items:center;"><div style="width:16px;height:16px;background:#a50026;border:1px solid #999"></div><div>Worse</div></div>
 </div>
 """
 st.markdown(legend_html, unsafe_allow_html=True)
 
-def render_table(title, indicators):
-    st.subheader(title)
-    header = ['<th style="position:sticky;left:0;background:#333;color:white;z-index:5">Indicator</th>']
-    for i, q in enumerate(qlabels):
-        bg = "#cfe2f3" if i == 0 else "#f0f0f0"
-        header.append(f'<th style="background:{bg};text-align:center">{q}</th>')
-    header_html = "<tr>" + "".join(header) + "</tr>"
+# -----------------------
+# Table rendering (one table per bucket)
+# Styling: uniform column width, larger indicator column, row borders, sticky left column
+# -----------------------
+COL_WIDTH_PX = 140  # width for each quarter column (wide enough for "Q4 2025")
+INDICATOR_COL_WIDTH_PX = 300
 
+def render_bucket_table(bucket_name, indicators):
+    st.subheader(bucket_name)
+    # table header
+    header_cells = [f'<th style="position:sticky; left:0; background:#222; color:white; z-index:5; min-width:{INDICATOR_COL_WIDTH_PX}px; width:{INDICATOR_COL_WIDTH_PX}px; text-align:left; padding:10px;">Indicator</th>']
+    for i, q in enumerate(quarter_labels):
+        bg = "#cfe2f3" if i == 0 else "#f8f8f8"
+        header_cells.append(f'<th style="background:{bg}; min-width:{COL_WIDTH_PX}px; width:{COL_WIDTH_PX}px; text-align:center; padding:10px;">{_html.escape(q)}</th>')
+    header_html = "<tr>" + "".join(header_cells) + "</tr>"
+
+    # body rows
     rows_html = []
     for name in indicators:
         s = qdata.get(name, pd.Series(dtype=float))
-        z = zscore(s, DIRECTION.get(name, 1))
-        row = [f'<td style="position:sticky;left:0;background:white;z-index:4">{_html.escape(name)}</td>']
-        for d in all_q:
+        # compute z based on underlying series before formatting
+        if name in YOY_SERIES:
+            z_series = zscore(s, DIRECTION.get(name, 1))
+        else:
+            z_series = zscore(s, DIRECTION.get(name, 1))
+        # left sticky label
+        row_cells = [f'<td style="position:sticky; left:0; background:#fff; z-index:4; min-width:{INDICATOR_COL_WIDTH_PX}px; width:{INDICATOR_COL_WIDTH_PX}px; padding:10px; border-right:1px solid #e6e6e6; font-weight:500;">{_html.escape(name)}</td>']
+        for d in all_quarters:
             if d in s.index:
                 val = s.loc[d]
-                fmt = FORMAT["pct"] if name in YOY_SERIES else FORMAT["float"]
-                cell = fmt(val)
-                bg = color(z.loc[d])
+                display = format_cell_value(name, val)
+                bg = color_for_z(z_series.loc[d]) if d in z_series.index else "white"
             else:
-                cell, bg = "n/a", "white"
-            row.append(f'<td style="background:{bg};text-align:center">{cell}</td>')
-        rows_html.append("<tr>" + "".join(row) + "</tr>")
+                display = "n/a"
+                bg = "white"
+            row_cells.append(f'<td style="background:{bg}; min-width:{COL_WIDTH_PX}px; width:{COL_WIDTH_PX}px; text-align:center; padding:10px; border-bottom:1px solid #e9e9e9;">{_html.escape(display)}</td>')
+        rows_html.append("<tr>" + "".join(row_cells) + "</tr>")
 
-    table = f"""
-    <div style="overflow-x:auto">
-    <table style="border-collapse:collapse;width:100%">
-      <thead>{header_html}</thead>
-      <tbody>{"".join(rows_html)}</tbody>
-    </table>
+    table_html = f"""
+    <div style="overflow-x:auto; margin-bottom:12px;">
+      <table style="border-collapse:separate; border-spacing:0; font-family:Arial, Helvetica, sans-serif;">
+        <thead>{header_html}</thead>
+        <tbody>{"".join(rows_html)}</tbody>
+      </table>
     </div>
     """
-    st.markdown(table, unsafe_allow_html=True)
+    st.markdown(table_html, unsafe_allow_html=True)
 
-for bucket, indicators in BUCKETS.items():
-    render_table(bucket, list(indicators.keys()))
+# render each bucket in order
+for bucket_name, indicators in BUCKETS.items():
+    render_bucket_table(bucket_name, list(indicators.keys()))
 
 # -----------------------
-# Bottom chart
+# Bottom single-chart (single line only)
 # -----------------------
 st.markdown("---")
 st.subheader("Single indicator chart")
-
 indicator = st.selectbox("Select indicator", list(qdata.keys()))
-years = st.selectbox("Timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
+timeframe = st.selectbox("Timeframe", ["1Y", "3Y", "5Y", "10Y", "Max"], index=2)
 
-s = qdata[indicator]
-if not s.empty:
-    last = s.index.max()
-    if years != "Max":
-        cutoff = last - pd.DateOffset(years=int(years[:-1]))
-        s = s[s.index >= cutoff]
-
-    df = s.reset_index()
+series = qdata.get(indicator, pd.Series(dtype=float))
+if not series.empty:
+    last = series.index.max()
+    if timeframe != "Max":
+        years = int(timeframe[:-1])
+        cutoff = last - pd.DateOffset(years=years)
+        series = series[series.index >= cutoff]
+    df = series.reset_index()
     df.columns = ["date", "value"]
-
     title = f"{indicator} — YoY %" if indicator in YOY_SERIES else f"{indicator} — Level"
     fig = px.line(df, x="date", y="value", markers=True, title=title)
-    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.update_layout(xaxis_rangeslider_visible=False, margin=dict(t=40,b=20))
     st.plotly_chart(fig, use_container_width=True)
+else:
+    st.write("No data available for this indicator.")
 
 st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
