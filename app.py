@@ -150,10 +150,11 @@ COL_W = 140
 IND_W = 320
 
 # Column header row (sticky at top:0). Make the "Indicator" cell also sticky at top:0,left:0
+# NOTE: increase z-index on header cells so header stays above left-sticky cells when scrolling.
 header = (
-    f'<th style="position:sticky;top:0;left:0;z-index:15;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
+    f'<th style="position:sticky;top:0;left:0;z-index:18;background:#222;color:white;min-width:{IND_W}px;padding:10px;text-align:left;">Indicator</th>'
     + "".join(
-        f'<th style="position:sticky;top:0;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;">{_html.escape(q)}</th>'
+        f'<th style="position:sticky;top:0;z-index:17;background:#f0f0f0;min-width:{COL_W}px;padding:10px;text-align:center;border-bottom:1px solid #ddd;">{_html.escape(q)}</th>'
         for q in labels
     )
 )
@@ -178,7 +179,7 @@ for bucket, indicators in BUCKETS.items():
         s = qdata.get(name, pd.Series(dtype=float))
         z = zscore(s, DIRECTION.get(name, 1))
         row = [
-            f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;padding:10px;border-right:1px solid #ddd;font-weight:400;">&nbsp;&nbsp;{_html.escape(name)}</td>'
+            f'<td style="position:sticky;left:0;background:white;min-width:{IND_W}px;padding:10px;border-right:1px solid #ddd;font-weight:400; z-index:15;">&nbsp;&nbsp;{_html.escape(name)}</td>'
         ]
         for d in quarters:
             if d in s.index:
@@ -193,9 +194,11 @@ for bucket, indicators in BUCKETS.items():
             )
         rows_html.append("<tr>" + "".join(row) + "</tr>")
 
+# Key change: set max-height on the scroll container so the table's internal scroll bar appears.
+# position:relative and width:max-content let the table size to contents and allow horizontal scroll.
 table_html = f"""
-<div style="overflow:auto;border:1px solid #eee;">
-<table style="border-collapse:separate;border-spacing:0;font-family:Arial,Helvetica,sans-serif;">
+<div style="max-height:70vh; overflow:auto; border:1px solid #eee;">
+<table style="border-collapse:separate;border-spacing:0;font-family:Arial,Helvetica,sans-serif; width: max-content; position:relative;">
 <thead><tr>{header}</tr></thead>
 <tbody>
 {''.join(rows_html)}
